@@ -1,0 +1,231 @@
+# Example: GitHub Actions Workflow for k3s Deployment
+#
+# This demonstrates CI/CD deployment to k3s using the tenant kubeconfig.
+#
+# Setup:
+# 1. Generate a tenant with bin/create-tenant.sh
+# 2. Encode the kubeconfig:
+#    cat mytenant-kubeconfig.yaml | base64 -w 0
+# 3. Add GitHub repository secrets:
+#    - KUBECONFIG (required)
+#    - REGISTRY_USERNAME (optional, for private registries)
+#    - REGISTRY_PASSWORD (optional, for private registries)
+# 4. Create k8s/ directory in your repo with deployment manifests
+# 5. Push to main branch to trigger deployment
+#
+# Features:
+# - Automatic deployment on push to main
+# - Manual workflow dispatch
+# - Deployment verification
+# - Rollback capability
+
+name: Deploy to k3s
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:  # Allow manual trigger
+
+env:
+  DEPLOYMENT_NAME: myapp
+  NAMESPACE: mytenant  # Change to your tenant namespace
+  REGISTRY_SERVER: ghcr.io  # Change to your registry (docker.io, etc.)
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'latest'
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Verify cluster connection
+        run: |
+          echo "Testing cluster connection..."
+          kubectl cluster-info
+          kubectl get nodes
+
+      - name: Deploy to k3s
+        env:
+          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+        run: |
+          echo "Deploying to namespace: $NAMESPACE"
+
+          # Install envsubst if not available
+          if ! command -v envsubst &> /dev/null; then
+            sudo apt-get update && sudo apt-get install -y gettext-base
+          fi
+
+          # Apply manifests with environment variable substitution
+          for file in k8s/*.yaml; do
+            echo "Applying $file..."
+            envsubst < "$file" | kubectl apply -f -
+          done
+
+      - name: Verify deployment
+        run: |
+          echo "Waiting for deployment rollout..."
+          kubectl rollout status deployment/$DEPLOYMENT_NAME --namespace=$NAMESPACE --timeout=300s
+
+      - name: Get deployment status
+        run: |
+          echo "=== Deployment Status ==="
+          kubectl get deployments --namespace=$NAMESPACE
+          echo ""
+          echo "=== Pods ==="
+          kubectl get pods --namespace=$NAMESPACE
+          echo ""
+          echo "=== Services ==="
+          kubectl get services --namespace=$NAMESPACE
+          echo ""
+          echo "=== Ingresses ==="
+          kubectl get ingress --namespace=$NAMESPACE
+
+---
+# Example: Multi-environment deployment with different branches
+# Save as: .github/workflows/deploy-multi-env.yml
+#
+# name: Deploy Multi-Environment
+#
+# on:
+#   push:
+#     branches:
+#       - main
+#       - staging
+#   workflow_dispatch:
+#     inputs:
+#       environment:
+#         description: 'Environment to deploy to'
+#         required: true
+#         type: choice
+#         options:
+#           - production
+#           - staging
+#
+# jobs:
+#   deploy:
+#     runs-on: ubuntu-latest
+#     steps:
+#       - uses: actions/checkout@v4
+#
+#       - name: Set environment
+#         id: set-env
+#         run: |
+#           if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+#             echo "environment=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+#           elif [ "${{ github.ref }}" == "refs/heads/main" ]; then
+#             echo "environment=production" >> $GITHUB_OUTPUT
+#           elif [ "${{ github.ref }}" == "refs/heads/staging" ]; then
+#             echo "environment=staging" >> $GITHUB_OUTPUT
+#           fi
+#
+#       - uses: azure/setup-kubectl@v3
+#
+#       - name: Configure kubeconfig
+#         run: |
+#           mkdir -p ~/.kube
+#           if [ "${{ steps.set-env.outputs.environment }}" == "production" ]; then
+#             echo "${{ secrets.KUBECONFIG_PROD }}" | base64 -d > ~/.kube/config
+#           else
+#             echo "${{ secrets.KUBECONFIG_STAGING }}" | base64 -d > ~/.kube/config
+#           fi
+#           chmod 600 ~/.kube/config
+#
+#       - name: Deploy
+#         run: |
+#           kubectl apply -f k8s/${{ steps.set-env.outputs.environment }}/
+#           kubectl rollout status deployment/myapp --timeout=300s
+
+---
+# Example: Build, Push, and Deploy with registry credentials
+# Save as: .github/workflows/build-and-deploy.yml
+#
+# Required GitHub secrets:
+#   - KUBECONFIG
+#   - REGISTRY_USERNAME
+#   - REGISTRY_PASSWORD
+#
+# name: Build and Deploy
+#
+# on:
+#   push:
+#     branches: [main]
+#
+# env:
+#   REGISTRY_SERVER: ghcr.io
+#   IMAGE_NAME: myapp
+#   IMAGE_TAG: ${{ github.sha }}
+#   DEPLOYMENT_NAME: myapp
+#   NAMESPACE: mytenant
+#
+# jobs:
+#   build-and-deploy:
+#     runs-on: ubuntu-latest
+#     steps:
+#       - name: Checkout code
+#         uses: actions/checkout@v4
+#
+#       - name: Set up kubectl
+#         uses: azure/setup-kubectl@v3
+#
+#       - name: Configure kubeconfig
+#         run: |
+#           mkdir -p ~/.kube
+#           echo "${{ secrets.KUBECONFIG }}" | base64 -d > ~/.kube/config
+#           chmod 600 ~/.kube/config
+#
+#       - name: Login to container registry
+#         run: |
+#           echo "${{ secrets.REGISTRY_PASSWORD }}" | docker login ${{ env.REGISTRY_SERVER }} \
+#             -u "${{ secrets.REGISTRY_USERNAME }}" --password-stdin
+#
+#       - name: Build Docker image
+#         run: |
+#           FULL_IMAGE="${{ env.REGISTRY_SERVER }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+#           echo "Building image: $FULL_IMAGE"
+#           docker build -t "$FULL_IMAGE" .
+#           echo "image=$FULL_IMAGE" >> $GITHUB_ENV
+#
+#       - name: Push Docker image
+#         run: |
+#           echo "Pushing image: ${{ env.image }}"
+#           docker push "${{ env.image }}"
+#
+#       - name: Update Kubernetes deployment
+#         env:
+#           REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+#           REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+#         run: |
+#           # Install envsubst if not available
+#           if ! command -v envsubst &> /dev/null; then
+#             sudo apt-get update && sudo apt-get install -y gettext-base
+#           fi
+#
+#           # Update image tag in deployment
+#           sed -i "s|image:.*|image: ${{ env.image }}|g" k8s/app.yaml
+#
+#           # Apply with environment variable substitution
+#           envsubst < k8s/app.yaml | kubectl apply -f -
+#
+#       - name: Verify deployment
+#         run: |
+#           kubectl rollout status deployment/${{ env.DEPLOYMENT_NAME }} \
+#             --namespace=${{ env.NAMESPACE }} \
+#             --timeout=300s
+#
+#       - name: Get deployment status
+#         run: |
+#           kubectl get pods --namespace=${{ env.NAMESPACE }}
+#           kubectl get deployments --namespace=${{ env.NAMESPACE }}
