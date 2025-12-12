@@ -76,6 +76,31 @@ configure_hostname() {
         return 0
     fi
 
+    # Check if k3s is already installed - prevent hostname changes
+    if command -v k3s &> /dev/null; then
+        local current_hostname=$(hostname)
+        local k3s_node_name=$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+
+        if [ -n "$k3s_node_name" ] && [ "$k3s_node_name" != "$API_DOMAIN" ]; then
+            log_error "CRITICAL: k3s is already installed with hostname: $k3s_node_name"
+            log_error "Cannot change hostname to: $API_DOMAIN"
+            log_error "Changing hostname on an existing k3s installation will cause:"
+            log_error "  - Multiple nodes in the cluster"
+            log_error "  - Persistent volume binding issues"
+            log_error "  - Service disruption"
+            echo ""
+            log_error "To reconfigure hostname, you must first uninstall k3s:"
+            echo "  sudo /usr/local/bin/k3s-uninstall.sh"
+            echo "  sudo rm -rf /var/lib/rancher/k3s"
+            echo "  Then run this installer again."
+            echo ""
+            exit 1
+        fi
+
+        log_info "k3s already installed with compatible hostname: $k3s_node_name"
+        return 0
+    fi
+
     log_info "Configuring system hostname to: $API_DOMAIN"
     hostnamectl set-hostname "$API_DOMAIN"
 
@@ -136,10 +161,34 @@ wait_for_k3s() {
 
 # Prompt for configuration
 prompt_config() {
+    # Try to load existing configuration
+    local existing_email=""
+    local existing_domain=""
+
+    if kubectl get configmap kwo-config -n kube-system &>/dev/null; then
+        existing_email=$(kubectl get configmap kwo-config -n kube-system -o jsonpath='{.data.acme-email}' 2>/dev/null || echo "")
+        existing_domain=$(kubectl get configmap kwo-config -n kube-system -o jsonpath='{.data.api-domain}' 2>/dev/null || echo "")
+    fi
+
     if [ "${NON_INTERACTIVE:-false}" = "true" ]; then
         log_info "Running in non-interactive mode"
-        ACME_EMAIL="${ACME_EMAIL:?ACME_EMAIL environment variable is required - needed for Let\'s Encrypt}"
-        API_DOMAIN="${API_DOMAIN:-}"
+
+        # Use existing email if available and not overridden
+        if [ -n "$existing_email" ] && [ -z "${ACME_EMAIL:-}" ]; then
+            ACME_EMAIL="$existing_email"
+            log_info "Using existing ACME email: $ACME_EMAIL"
+        else
+            ACME_EMAIL="${ACME_EMAIL:?ACME_EMAIL environment variable is required - needed for Let\'s Encrypt}"
+        fi
+
+        # Use existing domain if available and not overridden
+        if [ -n "$existing_domain" ] && [ -z "${API_DOMAIN:-}" ]; then
+            API_DOMAIN="$existing_domain"
+            log_info "Using existing API domain: $API_DOMAIN"
+        else
+            API_DOMAIN="${API_DOMAIN:-}"
+        fi
+
         return 0
     fi
 
@@ -148,26 +197,66 @@ prompt_config() {
     echo ""
 
     # Let's Encrypt email
-    echo "Let's Encrypt requires an email for certificate notifications."
-    echo "This is required even if you skip DNS configuration now."
-    read -p "Enter email for Let's Encrypt: " ACME_EMAIL
-    while [ -z "$ACME_EMAIL" ]; do
-        log_error "Email is required"
+    if [ -n "$existing_email" ]; then
+        echo "Current Let's Encrypt email: $existing_email"
+        read -p "Update email? [y/N]: " update_email
+
+        if [ "$update_email" = "y" ] || [ "$update_email" = "Y" ]; then
+            read -p "Enter new email for Let's Encrypt: " ACME_EMAIL
+            while [ -z "$ACME_EMAIL" ]; do
+                log_error "Email is required"
+                read -p "Enter new email for Let's Encrypt: " ACME_EMAIL
+            done
+        else
+            ACME_EMAIL="$existing_email"
+            log_info "Keeping existing email"
+        fi
+    else
+        echo "Let's Encrypt requires an email for certificate notifications."
+        echo "This is required even if you skip DNS configuration now."
         read -p "Enter email for Let's Encrypt: " ACME_EMAIL
-    done
+        while [ -z "$ACME_EMAIL" ]; do
+            log_error "Email is required"
+            read -p "Enter email for Let's Encrypt: " ACME_EMAIL
+        done
+    fi
 
     # API hostname (recommended for production)
     echo ""
-    echo "Enter the API server hostname (e.g., host1.example.com)"
-    echo "This will be used for:"
-    echo "  - System hostname"
-    echo "  - Kubernetes API server TLS certificate"
-    echo "  - Tenant kubeconfig files"
-    read -p "API hostname: " API_DOMAIN
-    while [ -z "$API_DOMAIN" ]; do
-        log_warn "API hostname is strongly recommended for production"
-        read -p "API hostname (or press Ctrl+C to exit): " API_DOMAIN
-    done
+    if [ -n "$existing_domain" ]; then
+        # Check if k3s is installed - hostname cannot be changed
+        if command -v k3s &> /dev/null; then
+            echo "Current API hostname: $existing_domain (locked - k3s installed)"
+            log_info "API hostname cannot be changed on existing k3s installation"
+            API_DOMAIN="$existing_domain"
+        else
+            # k3s not installed, allow hostname change
+            echo "Current API hostname: $existing_domain"
+            read -p "Update hostname? [y/N]: " update_domain
+
+            if [ "$update_domain" = "y" ] || [ "$update_domain" = "Y" ]; then
+                read -p "Enter new API hostname: " API_DOMAIN
+                while [ -z "$API_DOMAIN" ]; do
+                    log_warn "API hostname is strongly recommended for production"
+                    read -p "API hostname (or press Ctrl+C to exit): " API_DOMAIN
+                done
+            else
+                API_DOMAIN="$existing_domain"
+                log_info "Keeping existing API hostname"
+            fi
+        fi
+    else
+        echo "Enter the API server hostname (e.g., host1.example.com)"
+        echo "This will be used for:"
+        echo "  - System hostname"
+        echo "  - Kubernetes API server TLS certificate"
+        echo "  - Tenant kubeconfig files"
+        read -p "API hostname: " API_DOMAIN
+        while [ -z "$API_DOMAIN" ]; do
+            log_warn "API hostname is strongly recommended for production"
+            read -p "API hostname (or press Ctrl+C to exit): " API_DOMAIN
+        done
+    fi
 }
 
 # Prompt for DNS provider selection
