@@ -1024,6 +1024,12 @@ spec:
               value: "/auth/htpasswd"
             - name: REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY
               value: "/var/lib/registry"
+            - name: REGISTRY_HTTP_TIMEOUT_READ
+              value: "1800s"
+            - name: REGISTRY_HTTP_TIMEOUT_WRITE
+              value: "1800s"
+            - name: REGISTRY_STORAGE_DELETE_ENABLED
+              value: "true"
           volumeMounts:
             - name: registry-storage
               mountPath: /var/lib/registry
@@ -1082,8 +1088,22 @@ spec:
       name: http
 EOF
 
-    # 5. Create Ingress
-    log_info "[5/5] Creating registry Ingress with TLS..."
+    # 5. Create Traefik Middleware for extended timeouts
+    log_info "[5/6] Creating Traefik Middleware for registry timeouts..."
+    cat <<EOF | kubectl apply -f -
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: registry-timeouts
+  namespace: kube-system
+spec:
+  buffering:
+    maxRequestBodyBytes: 10737418240
+    maxResponseBodyBytes: 10737418240
+EOF
+
+    # 6. Create Ingress
+    log_info "[6/6] Creating registry Ingress with TLS..."
 
     # Debug: verify variables are set
     if [ -z "$REGISTRY_DOMAIN" ] || [ -z "$REGISTRY_CERT_RESOLVER" ]; then
@@ -1106,6 +1126,7 @@ metadata:
     traefik.ingress.kubernetes.io/router.entrypoints: websecure
     traefik.ingress.kubernetes.io/router.tls: "true"
     traefik.ingress.kubernetes.io/router.tls.certresolver: $REGISTRY_CERT_RESOLVER
+    traefik.ingress.kubernetes.io/router.middlewares: kube-system-registry-timeouts@kubernetescrd
 spec:
   rules:
     - host: $REGISTRY_DOMAIN
