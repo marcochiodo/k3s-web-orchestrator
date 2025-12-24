@@ -26,6 +26,24 @@ log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
+# Validate domain format (FQDN)
+validate_domain() {
+    local domain="$1"
+    [[ "$domain" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*$ ]]
+}
+
+# Generate 32-char random password (base64-safe, alphanumeric only)
+generate_password() {
+    openssl rand -base64 32 | tr -d '/+=' | head -c 32
+}
+
+# Create htpasswd bcrypt hash
+# Args: $1=username $2=password
+# Returns: username:$2y$...
+hash_password_bcrypt() {
+    htpasswd -Bbn "$1" "$2"
+}
+
 # Detect OS
 detect_os() {
     if [ -f /etc/os-release ]; then
@@ -61,12 +79,19 @@ install_prerequisites() {
         apt-get)
             export DEBIAN_FRONTEND=noninteractive
             apt-get update -qq
-            apt-get install -y -qq curl iptables jq
+            apt-get install -y -qq curl iptables jq apache2-utils
             ;;
         dnf)
-            dnf install -y -q curl iptables jq
+            dnf install -y -q curl iptables jq httpd-tools
             ;;
     esac
+
+    # Verify htpasswd is available
+    if ! command -v htpasswd &>/dev/null; then
+        log_error "htpasswd command not found after installation"
+        log_error "Package apache2-utils (Debian/Ubuntu) or httpd-tools (Fedora) may have failed to install"
+        exit 1
+    fi
 }
 
 # Configure system hostname
@@ -287,19 +312,93 @@ configure_dns_providers() {
     declare -g -a DNS_PROVIDER_LIST
     declare -g DNS_CONFIGURED=false
 
+    # Check for existing DNS providers
+    local existing_providers=""
+    if kubectl get configmap kwo-dns-providers -n kube-system &>/dev/null; then
+        existing_providers=$(kubectl get configmap kwo-dns-providers -n kube-system \
+            -o jsonpath='{.data.providers\.json}' 2>/dev/null | jq -r 'keys[]' 2>/dev/null || echo "")
+    fi
+
+    # Count existing providers
+    local existing_count=0
+    if [ -n "$existing_providers" ]; then
+        existing_count=$(echo "$existing_providers" | wc -l)
+    fi
+
+    # If providers exist, load them into DNS_PROVIDER_LIST
+    declare -g DNS_PROVIDERS_REUSED=false
+    if [ "$existing_count" -gt 0 ]; then
+        log_info "Found $existing_count existing DNS provider(s)"
+        while IFS= read -r resolver; do
+            # Extract provider name from resolver (e.g., "letsencrypt-cloudflare" -> "cloudflare")
+            local provider=$(echo "$resolver" | sed 's/^letsencrypt-//' | sed 's/-.*$//')
+            DNS_PROVIDER_LIST+=("$provider")
+        done <<< "$existing_providers"
+        DNS_CONFIGURED=true
+        DNS_PROVIDERS_REUSED=true
+    fi
+
     if [ "${NON_INTERACTIVE:-false}" = "true" ]; then
         if [ "${DNS_SKIP:-false}" = "true" ]; then
             log_warn "Skipping DNS provider configuration (DNS_SKIP=true)"
             DNS_CONFIGURED=false
             return 0
         fi
-        DNS_PROVIDER="${DNS_PROVIDER:?DNS_PROVIDER required}"
-        DNS_PROVIDER_LIST=("$DNS_PROVIDER")
-        DNS_CONFIGURED=true
+
+        # If no existing providers, add from env var
+        if [ "$existing_count" -eq 0 ]; then
+            DNS_PROVIDER="${DNS_PROVIDER:?DNS_PROVIDER required}"
+            DNS_PROVIDER_LIST=("$DNS_PROVIDER")
+            DNS_CONFIGURED=true
+        fi
         return 0
     fi
 
-    # Interactive mode - ask if configure now
+    # Interactive mode
+    if [ "$existing_count" -gt 0 ]; then
+        # Existing providers found - ask if add more
+        echo ""
+        echo "=== DNS Provider Configuration ==="
+        echo ""
+        echo "Existing DNS providers:"
+        for provider in "${DNS_PROVIDER_LIST[@]}"; do
+            echo "  - letsencrypt-${provider}"
+        done
+        echo ""
+        read -p "Add another DNS provider? [y/N]: " add_more
+
+        if [ "$add_more" != "y" ] && [ "$add_more" != "Y" ]; then
+            log_info "Using existing DNS providers"
+            DNS_PROVIDERS_REUSED=true
+            return 0
+        fi
+
+        # Continue to add more providers
+        local add_another="y"
+        local provider_num=$((existing_count + 1))
+
+        while [ "$add_another" = "y" ] || [ "$add_another" = "Y" ]; do
+            log_info "Configuring DNS provider #${provider_num}..."
+            local provider=$(prompt_dns_provider)
+            if [ -z "$provider" ]; then
+                continue
+            fi
+            if [[ " ${DNS_PROVIDER_LIST[@]} " =~ " ${provider} " ]]; then
+                log_warn "Provider $provider already configured, skipping..."
+                continue
+            fi
+            prompt_dns_credentials "$provider"
+            DNS_PROVIDER_LIST+=("$provider")
+            provider_num=$((provider_num + 1))
+            echo ""
+            read -p "Configure another DNS provider? (y/n): " add_another
+        done
+
+        log_info "Total ${#DNS_PROVIDER_LIST[@]} DNS provider(s) configured"
+        return 0
+    fi
+
+    # No existing providers - show initial prompt
     echo ""
     echo "=== DNS Provider Configuration ==="
     echo ""
@@ -418,6 +517,12 @@ create_dns_secret() {
         kubectl create secret generic dns-credentials -n kube-system \
             --from-literal=placeholder=placeholder \
             --dry-run=client -o yaml | kubectl apply -f -
+        return 0
+    fi
+
+    # Skip if reusing existing providers (secret already exists)
+    if [ "${DNS_PROVIDERS_REUSED:-false}" = "true" ]; then
+        log_info "Reusing existing DNS credentials secret"
         return 0
     fi
 
@@ -778,6 +883,7 @@ create_command_symlinks() {
         ["dns.sh"]="kwo-dns"
         ["check-tls.sh"]="kwo-check-tls"
         ["logs.sh"]="kwo-logs"
+        ["registry.sh"]="kwo-registry"
     )
 
     for script in "${!COMMANDS[@]}"; do
@@ -785,6 +891,565 @@ create_command_symlinks() {
         local link="$BIN_DIR/${COMMANDS[$script]}"
         [ -f "$source" ] && { rm -f "$link"; ln -s "$source" "$link"; log_info "Created command: ${COMMANDS[$script]}"; }
     done
+}
+
+# =============================================================================
+# REGISTRY CONFIGURATION FUNCTIONS
+# =============================================================================
+
+# Select DNS provider for registry certificate resolver
+# Returns: resolver name (e.g., "letsencrypt-cloudflare")
+select_dns_provider_for_registry() {
+    local existing_resolver="${1:-}"
+
+    # Count providers from DNS_PROVIDER_LIST
+    local dns_count=${#DNS_PROVIDER_LIST[@]}
+
+    if [ "$dns_count" -eq 0 ]; then
+        log_error "No DNS providers configured"
+        return 1
+    elif [ "$dns_count" -eq 1 ]; then
+        # Auto-select single provider
+        local resolver="letsencrypt-${DNS_PROVIDER_LIST[0]}"
+        log_info "Auto-selected DNS provider: $resolver" >&2
+        echo "$resolver"
+        return 0
+    else
+        # Multiple providers - interactive selection
+        echo ""
+        echo "Multiple DNS providers available:"
+        echo ""
+
+        local i=1
+        declare -A resolver_map
+
+        for provider in "${DNS_PROVIDER_LIST[@]}"; do
+            local resolver="letsencrypt-${provider}"
+            echo "$i) $resolver"
+            resolver_map[$i]="$resolver"
+            i=$((i + 1))
+        done
+
+        echo ""
+
+        if [ -n "$existing_resolver" ]; then
+            echo "Current selection: $existing_resolver"
+            read -p "Keep current selection? [Y/n]: " keep_current
+
+            if [ "$keep_current" != "n" ] && [ "$keep_current" != "N" ]; then
+                echo "$existing_resolver"
+                return 0
+            fi
+        fi
+
+        read -p "Select DNS provider [1-$((i-1))]: " choice
+
+        while [ -z "${resolver_map[$choice]:-}" ]; do
+            log_error "Invalid choice"
+            read -p "Select DNS provider [1-$((i-1))]: " choice
+        done
+
+        echo "${resolver_map[$choice]}"
+        return 0
+    fi
+}
+
+# Deploy registry Kubernetes resources
+deploy_registry_resources() {
+    log_info "Deploying registry resources..."
+
+    # 1. Create registry-auth Secret
+    log_info "[1/5] Creating registry-auth Secret..."
+    kubectl create secret generic registry-auth -n kube-system \
+        --from-literal=htpasswd="$REGISTRY_HTPASSWD" \
+        --from-literal=username="$REGISTRY_USERNAME" \
+        --from-literal=password="$REGISTRY_PASSWORD" \
+        --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+
+    # 2. Create PersistentVolumeClaim
+    log_info "[2/5] Creating registry PVC (50Gi)..."
+    cat <<EOF | kubectl apply -f - >/dev/null
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: registry-storage
+  namespace: kube-system
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 50Gi
+  storageClassName: local-path
+EOF
+
+    # Note: PVC will bind when the registry pod is created (WaitForFirstConsumer)
+
+    # 3. Create Deployment
+    log_info "[3/5] Creating registry Deployment..."
+    cat <<EOF | kubectl apply -f - >/dev/null
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: registry
+  namespace: kube-system
+  labels:
+    app: registry
+    managed-by: kwo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: registry
+  template:
+    metadata:
+      labels:
+        app: registry
+    spec:
+      containers:
+        - name: registry
+          image: registry:2
+          ports:
+            - name: http
+              containerPort: 5000
+          env:
+            - name: REGISTRY_AUTH
+              value: "htpasswd"
+            - name: REGISTRY_AUTH_HTPASSWD_REALM
+              value: "Registry Realm"
+            - name: REGISTRY_AUTH_HTPASSWD_PATH
+              value: "/auth/htpasswd"
+            - name: REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY
+              value: "/var/lib/registry"
+          volumeMounts:
+            - name: registry-storage
+              mountPath: /var/lib/registry
+            - name: auth
+              mountPath: /auth
+              readOnly: true
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - name: registry-storage
+          persistentVolumeClaim:
+            claimName: registry-storage
+        - name: auth
+          secret:
+            secretName: registry-auth
+            items:
+              - key: htpasswd
+                path: htpasswd
+EOF
+
+    # 4. Create Service
+    log_info "[4/5] Creating registry Service..."
+    cat <<EOF | kubectl apply -f - >/dev/null
+apiVersion: v1
+kind: Service
+metadata:
+  name: registry
+  namespace: kube-system
+  labels:
+    app: registry
+spec:
+  type: ClusterIP
+  selector:
+    app: registry
+  ports:
+    - port: 5000
+      targetPort: http
+      protocol: TCP
+      name: http
+EOF
+
+    # 5. Create Ingress
+    log_info "[5/5] Creating registry Ingress with TLS..."
+
+    # Debug: verify variables are set
+    if [ -z "$REGISTRY_DOMAIN" ] || [ -z "$REGISTRY_CERT_RESOLVER" ]; then
+        log_error "Missing required variables:"
+        log_error "  REGISTRY_DOMAIN='$REGISTRY_DOMAIN'"
+        log_error "  REGISTRY_CERT_RESOLVER='$REGISTRY_CERT_RESOLVER'"
+        exit 1
+    fi
+
+    cat <<EOF | kubectl apply -f -
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: registry
+  namespace: kube-system
+  labels:
+    app: registry
+    managed-by: kwo
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    traefik.ingress.kubernetes.io/router.tls.certresolver: $REGISTRY_CERT_RESOLVER
+spec:
+  rules:
+    - host: $REGISTRY_DOMAIN
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: registry
+                port:
+                  number: 5000
+  tls:
+    - hosts:
+        - $REGISTRY_DOMAIN
+EOF
+
+    log_info "Registry resources deployed successfully"
+
+    # Wait for registry pod to be ready
+    log_info "Waiting for registry pod to be ready..."
+    local max_wait=60
+    local count=0
+    while [ $count -lt $max_wait ]; do
+        local pod_ready=$(kubectl get pods -n kube-system -l app=registry \
+            -o jsonpath='{.items[0].status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "False")
+
+        if [ "$pod_ready" = "True" ]; then
+            log_info "Registry pod is ready"
+            break
+        fi
+
+        sleep 2
+        count=$((count + 1))
+    done
+
+    if [ $count -eq $max_wait ]; then
+        log_warn "Registry pod did not become ready within expected time"
+        log_warn "Check status with: kubectl get pods -n kube-system -l app=registry"
+    fi
+}
+
+# Configure k3s to use private registry globally
+configure_k3s_registry() {
+    log_info "Configuring k3s registry integration..."
+
+    local registries_file="/etc/rancher/k3s/registries.yaml"
+    local registries_dir="/etc/rancher/k3s"
+
+    # Create directory if it doesn't exist
+    mkdir -p "$registries_dir"
+
+    # Archive existing file if present
+    if [ -f "$registries_file" ]; then
+        local timestamp=$(date +%Y%m%d-%H%M%S)
+        local archive_dir="/var/lib/kwo/archive"
+        mkdir -p "$archive_dir"
+        cp "$registries_file" "$archive_dir/registries-${timestamp}.yaml"
+        chmod 600 "$archive_dir/registries-${timestamp}.yaml"
+        log_info "Archived existing registries.yaml"
+    fi
+
+    # Write new registries.yaml
+    cat > "$registries_file" <<EOF
+# KWO Private Registry Configuration
+# Auto-generated by KWO install.sh
+# Last updated: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+configs:
+  "$REGISTRY_DOMAIN":
+    auth:
+      username: $REGISTRY_USERNAME
+      password: $REGISTRY_PASSWORD
+    tls:
+      insecure_skip_verify: false
+EOF
+
+    chmod 600 "$registries_file"
+    log_info "Written /etc/rancher/k3s/registries.yaml"
+
+    # Restart k3s to apply changes
+    log_info "Restarting k3s to apply registry configuration..."
+    if ! systemctl restart k3s; then
+        log_error "Failed to restart k3s"
+        log_error "Check: systemctl status k3s"
+        log_error "Config: /etc/rancher/k3s/registries.yaml"
+        exit 1
+    fi
+
+    # Wait for k3s to be ready
+    wait_for_k3s
+
+    log_info "k3s restarted with registry configuration"
+}
+
+# Save registry configuration to kwo-config ConfigMap
+save_registry_config() {
+    log_info "Saving registry configuration to kwo-config..."
+
+    local created_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+    # Update ConfigMap with registry fields
+    kubectl patch configmap kwo-config -n kube-system --type=merge -p "{\"data\":{\"registry-enabled\":\"true\",\"registry-domain\":\"$REGISTRY_DOMAIN\",\"registry-username\":\"$REGISTRY_USERNAME\",\"registry-certresolver\":\"$REGISTRY_CERT_RESOLVER\",\"registry-created-at\":\"$created_at\"}}" >/dev/null
+
+    log_info "Registry configuration saved"
+}
+
+# Print registry credentials and usage instructions
+print_registry_credentials() {
+    echo ""
+    echo "========================================="
+    echo "  Private Registry Configured"
+    echo "========================================="
+    echo ""
+    echo "Registry URL: https://$REGISTRY_DOMAIN"
+    echo "Username: $REGISTRY_USERNAME"
+    echo "Password: $REGISTRY_PASSWORD"
+    echo ""
+    log_warn "IMPORTANT: Save these credentials securely!"
+    echo ""
+    echo "Usage:"
+    echo ""
+    echo "1. Login to registry from external machine:"
+    echo "   docker login $REGISTRY_DOMAIN"
+    echo "   # Enter username and password when prompted"
+    echo ""
+    echo "2. Push image:"
+    echo "   docker tag myapp:latest $REGISTRY_DOMAIN/myapp:latest"
+    echo "   docker push $REGISTRY_DOMAIN/myapp:latest"
+    echo ""
+    echo "3. Deploy in tenant (automatic pull, no imagePullSecrets needed):"
+    echo "   kubectl apply -f - <<EOF"
+    echo "   apiVersion: apps/v1"
+    echo "   kind: Deployment"
+    echo "   metadata:"
+    echo "     name: myapp"
+    echo "   spec:"
+    echo "     template:"
+    echo "       spec:"
+    echo "         containers:"
+    echo "           - name: myapp"
+    echo "             image: $REGISTRY_DOMAIN/myapp:latest"
+    echo "   EOF"
+    echo ""
+    echo "Configuration:"
+    echo "  - Storage: 50Gi PVC (local-path)"
+    echo "  - TLS: Automatic via $REGISTRY_CERT_RESOLVER"
+    echo "  - Auth: htpasswd (bcrypt)"
+    echo "  - k3s integration: /etc/rancher/k3s/registries.yaml"
+    echo ""
+    echo "Management commands:"
+    echo "  kwo-registry status              # Check registry status"
+    echo "  kwo-registry rotate-credentials  # Rotate password"
+    echo "  kwo-registry get-credentials     # Display credentials"
+    echo ""
+}
+
+# Configure private Docker registry
+# Called after: configure_dns_providers
+# Called before: generate_traefik_config
+configure_registry() {
+    # Check DNS provider count
+    local dns_count=${#DNS_PROVIDER_LIST[@]}
+
+    if [ "$dns_count" -eq 0 ]; then
+        if [ "${NON_INTERACTIVE:-false}" = "true" ] && [ "${REGISTRY_SKIP:-false}" != "true" ]; then
+            log_error "Cannot configure registry: No DNS providers configured"
+            log_error "Registry requires DNS provider for automatic TLS certificates"
+            exit 1
+        fi
+        log_warn "No DNS providers configured - skipping registry setup"
+        log_warn "Configure DNS providers first with: sudo kwo-dns add <provider>"
+        return 0
+    fi
+
+    # Check for existing configuration
+    local existing_domain=""
+    local existing_username=""
+    local existing_resolver=""
+
+    if kubectl get configmap kwo-config -n kube-system &>/dev/null; then
+        existing_domain=$(kubectl get configmap kwo-config -n kube-system \
+            -o jsonpath='{.data.registry-domain}' 2>/dev/null || echo "")
+        existing_username=$(kubectl get configmap kwo-config -n kube-system \
+            -o jsonpath='{.data.registry-username}' 2>/dev/null || echo "")
+        existing_resolver=$(kubectl get configmap kwo-config -n kube-system \
+            -o jsonpath='{.data.registry-certresolver}' 2>/dev/null || echo "")
+    fi
+
+    # Interactive mode
+    if [ "${NON_INTERACTIVE:-false}" != "true" ]; then
+        echo ""
+        echo "=== Private Docker Registry Configuration ==="
+        echo ""
+        echo "KWO can deploy a private Docker registry for your tenants."
+        echo "Features:"
+        echo "  - Automatic TLS via Traefik"
+        echo "  - htpasswd authentication"
+        echo "  - Global k3s integration (all tenants can pull)"
+        echo "  - 50Gi persistent storage"
+        echo ""
+
+        read -p "Configure private registry now? [Y/n]: " configure_registry_now
+
+        if [ "$configure_registry_now" = "n" ] || [ "$configure_registry_now" = "N" ]; then
+            log_info "Skipping registry configuration"
+            return 0
+        fi
+
+        # Prompt for registry domain
+        if [ -n "$existing_domain" ]; then
+            echo ""
+            echo "Current registry domain: $existing_domain"
+            read -p "Update domain? [y/N]: " update_domain
+
+            if [ "$update_domain" = "y" ] || [ "$update_domain" = "Y" ]; then
+                read -p "Registry domain (e.g., registry.example.com): " REGISTRY_DOMAIN
+                # Validate domain
+                while ! validate_domain "$REGISTRY_DOMAIN"; do
+                    log_error "Invalid domain format (must be valid FQDN)"
+                    read -p "Registry domain: " REGISTRY_DOMAIN
+                done
+            else
+                REGISTRY_DOMAIN="$existing_domain"
+            fi
+        else
+            read -p "Registry domain (e.g., registry.example.com): " REGISTRY_DOMAIN
+            # Validate domain
+            while ! validate_domain "$REGISTRY_DOMAIN"; do
+                log_error "Invalid domain format (must be valid FQDN)"
+                read -p "Registry domain: " REGISTRY_DOMAIN
+            done
+        fi
+
+        # Select DNS provider for cert resolver
+        if [ -n "$existing_resolver" ]; then
+            REGISTRY_CERT_RESOLVER=$(select_dns_provider_for_registry "$existing_resolver")
+        else
+            REGISTRY_CERT_RESOLVER=$(select_dns_provider_for_registry "")
+        fi
+
+        # Prompt for username
+        if [ -n "$existing_username" ]; then
+            echo ""
+            echo "Current registry username: $existing_username"
+            read -p "Update username? [y/N]: " update_username
+
+            if [ "$update_username" = "y" ] || [ "$update_username" = "Y" ]; then
+                read -p "Registry username [docker]: " REGISTRY_USERNAME
+                REGISTRY_USERNAME="${REGISTRY_USERNAME:-docker}"
+            else
+                REGISTRY_USERNAME="$existing_username"
+            fi
+        else
+            read -p "Registry username [docker]: " REGISTRY_USERNAME
+            REGISTRY_USERNAME="${REGISTRY_USERNAME:-docker}"
+        fi
+
+        # Check for existing credentials
+        if kubectl get secret registry-auth -n kube-system &>/dev/null; then
+            echo ""
+            log_warn "Registry credentials already exist"
+            read -p "Regenerate password? [y/N]: " regenerate_password
+
+            if [ "$regenerate_password" = "y" ] || [ "$regenerate_password" = "Y" ]; then
+                REGENERATE_CREDS=true
+            else
+                REGENERATE_CREDS=false
+            fi
+        else
+            REGENERATE_CREDS=true
+        fi
+    else
+        # Non-interactive mode
+        if [ "${REGISTRY_SKIP:-false}" = "true" ]; then
+            log_info "Skipping registry configuration (REGISTRY_SKIP=true)"
+            return 0
+        fi
+
+        REGISTRY_DOMAIN="${REGISTRY_DOMAIN:?REGISTRY_DOMAIN required in non-interactive mode}"
+        REGISTRY_USERNAME="${REGISTRY_USERNAME:-docker}"
+
+        # Auto-select DNS provider
+        if [ "$dns_count" -eq 1 ]; then
+            REGISTRY_CERT_RESOLVER="letsencrypt-${DNS_PROVIDER_LIST[0]}"
+        else
+            REGISTRY_CERT_RESOLVER="${REGISTRY_CERT_RESOLVER:?REGISTRY_CERT_RESOLVER required when multiple DNS providers exist}"
+        fi
+
+        # Validate domain
+        if ! validate_domain "$REGISTRY_DOMAIN"; then
+            log_error "Invalid REGISTRY_DOMAIN format: $REGISTRY_DOMAIN"
+            exit 1
+        fi
+
+        REGENERATE_CREDS=true
+    fi
+
+    # Generate or retrieve credentials
+    if [ "$REGENERATE_CREDS" = true ]; then
+        log_info "Generating new registry credentials..."
+
+        # Archive old credentials if they exist
+        if kubectl get secret registry-auth -n kube-system &>/dev/null; then
+            local timestamp=$(date +%Y%m%d-%H%M%S)
+            local archive_dir="/var/lib/kwo/archive/registry-regenerate-${timestamp}"
+            mkdir -p "$archive_dir"
+            chmod 700 "$archive_dir"
+
+            kubectl get secret registry-auth -n kube-system -o yaml > "$archive_dir/registry-auth-secret.yaml"
+            [ -f /etc/rancher/k3s/registries.yaml ] && cp /etc/rancher/k3s/registries.yaml "$archive_dir/registries.yaml"
+            chmod 600 "$archive_dir"/*
+
+            log_info "Archived old credentials to $archive_dir"
+        fi
+
+        # Generate random password (32 chars, base64 safe)
+        REGISTRY_PASSWORD=$(generate_password)
+
+        # Create htpasswd hash (bcrypt)
+        REGISTRY_HTPASSWD=$(hash_password_bcrypt "$REGISTRY_USERNAME" "$REGISTRY_PASSWORD")
+
+    else
+        log_info "Reusing existing registry credentials..."
+
+        # Extract existing password from secret
+        REGISTRY_HTPASSWD=$(kubectl get secret registry-auth -n kube-system \
+            -o jsonpath='{.data.htpasswd}' | base64 -d)
+
+        REGISTRY_PASSWORD=$(kubectl get secret registry-auth -n kube-system \
+            -o jsonpath='{.data.password}' | base64 -d)
+    fi
+
+    # Deploy registry resources
+    deploy_registry_resources
+
+    # Configure k3s registries.yaml
+    configure_k3s_registry
+
+    # Update kwo-config ConfigMap
+    save_registry_config
+
+    # Print credentials to user
+    print_registry_credentials
+
+    # Mark registry as configured
+    REGISTRY_CONFIGURED=true
 }
 
 # Print next steps
@@ -880,6 +1545,7 @@ main() {
     wait_for_k3s
     configure_dns_providers
     create_dns_secret
+    configure_registry
     generate_traefik_config
     wait_for_traefik
     save_cluster_config

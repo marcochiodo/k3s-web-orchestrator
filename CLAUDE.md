@@ -10,6 +10,7 @@ A minimal k3s setup for deploying web services with automated SSL certificates a
 
 1. **install.sh** - One command to set up a production-ready k3s with:
    - Traefik configured for automatic Let's Encrypt via DNS-01
+   - Private Docker registry with automatic TLS (optional)
    - API endpoint exposed on a configurable domain
    - Ready for multi-tenant usage
 
@@ -18,7 +19,13 @@ A minimal k3s setup for deploying web services with automated SSL certificates a
    - Scoped ServiceAccount + RBAC
    - Kubeconfig for CI/CD
 
-3. **Examples** - Copy-paste ready YAML for common patterns
+3. **Private registry** - Optional Docker registry with:
+   - Automatic TLS certificates
+   - htpasswd authentication
+   - Global k3s integration (tenants can pull without imagePullSecrets)
+   - Credential rotation
+
+4. **Examples** - Copy-paste ready YAML for common patterns
 
 ### What KWO Does NOT Provide
 
@@ -141,16 +148,19 @@ kwo/
 │   ├── list-tenants.sh
 │   ├── update-tenant.sh
 │   ├── dns.sh                    # DNS provider management
+│   ├── registry.sh               # Registry management
 │   ├── status.sh                 # Diagnostics
 │   ├── check-tls.sh
 │   ├── logs.sh
 │   └── lib/
 │       ├── common.sh             # Shared library
-│       └── dns-helpers.sh        # DNS management helpers
+│       ├── dns-helpers.sh        # DNS management helpers
+│       └── registry-helpers.sh   # Registry management helpers
 └── examples/
     ├── deployment.yaml           # Example: basic deployment
     ├── ingress-tls.yaml          # Example: ingress with auto-TLS
     ├── cronjob.yaml              # Example: scheduled job
+    ├── registry-usage.yaml       # Example: using private registry
     └── github-actions/
         └── deploy.yml            # Example: CI/CD workflow
 ```
@@ -164,12 +174,14 @@ kwo/
 │   ├── list-tenants.sh
 │   ├── update-tenant.sh
 │   ├── dns.sh
+│   ├── registry.sh
 │   ├── status.sh
 │   ├── check-tls.sh
 │   ├── logs.sh
 │   └── lib/
 │       ├── common.sh
-│       └── dns-helpers.sh
+│       ├── dns-helpers.sh
+│       └── registry-helpers.sh
 └── VERSION                       # KWO version
 
 /var/lib/kwo/                     # Persistent state
@@ -177,7 +189,8 @@ kwo/
 ├── metadata/                     # Tenant metadata JSON (755)
 ├── archive/                      # Deleted tenant archives (700)
 │   ├── tenant-*/                 # Archived tenant data
-│   └── dns-*/                    # Archived DNS provider credentials
+│   ├── dns-*/                    # Archived DNS provider credentials
+│   └── registry-*/               # Archived registry credentials
 └── install.log                   # Installation history (640)
 
 /var/log/kwo/                     # Operation logs
@@ -190,6 +203,7 @@ kwo/
 ├── kwo-list-tenants -> /usr/share/kwo/bin/list-tenants.sh
 ├── kwo-update-tenant -> /usr/share/kwo/bin/update-tenant.sh
 ├── kwo-dns -> /usr/share/kwo/bin/dns.sh
+├── kwo-registry -> /usr/share/kwo/bin/registry.sh
 ├── kwo-status -> /usr/share/kwo/bin/status.sh
 ├── kwo-check-tls -> /usr/share/kwo/bin/check-tls.sh
 └── kwo-logs -> /usr/share/kwo/bin/logs.sh
@@ -199,16 +213,19 @@ kwo/
 
 ## install.sh Responsibilities
 
-1. Detect OS and install prerequisites
+1. Detect OS and install prerequisites (including htpasswd for registry)
 2. Install k3s
-3. Configure Traefik with ACME (DNS-01 challenge)
-4. Store DNS provider credentials as Kubernetes Secret
-5. Output instructions for creating first tenant
+3. Configure DNS providers for Let's Encrypt (optional)
+4. Configure private Docker registry (optional)
+5. Configure Traefik with ACME (DNS-01 challenge)
+6. Store DNS and registry credentials as Kubernetes Secrets
+7. Output instructions for creating first tenant
 
 **Configuration during install:**
 - Let's Encrypt email
-- DNS provider (Cloudflare/OVH/Route53/DigitalOcean)
+- DNS provider (Cloudflare/OVH/Route53/DigitalOcean) - optional
 - DNS provider credentials
+- Registry domain and username - optional
 - API endpoint domain (optional, can use IP)
 
 ---
@@ -245,6 +262,122 @@ kwo-dns remove <resolver-name> [--force]
 kwo-dns list [--format=table|json]
 kwo-dns update <resolver-name> [--non-interactive]
 kwo-dns check [resolver-name]
+```
+
+---
+
+## Private Docker Registry
+
+**Configuration Options:**
+- **During installation:** Optional prompt after DNS configuration
+- **After installation:** Re-run `./install.sh` to configure or update
+
+**Features:**
+- Automatic TLS via Traefik (Let's Encrypt DNS-01)
+- htpasswd authentication with bcrypt
+- Global k3s integration (`/etc/rancher/k3s/registries.yaml`)
+- All tenants can pull images automatically (no imagePullSecrets needed)
+- Credential rotation
+- 50Gi persistent storage (default)
+
+**Architecture:**
+```
+External (docker push/pull)
+    ↓ HTTPS (port 443, TLS via Traefik)
+Traefik Ingress (kube-system)
+    ↓ HTTP (internal)
+Service: registry:5000 (ClusterIP)
+    ↓
+Deployment: registry:2 (kube-system)
+    ↓
+PVC: registry-storage (50Gi)
+```
+
+**Storage:**
+- Images: PersistentVolumeClaim `registry-storage` (kube-system, 50Gi)
+- Credentials: Secret `registry-auth` (kube-system)
+  - htpasswd file (bcrypt hash)
+  - plaintext username and password (for k3s registries.yaml)
+- Configuration: ConfigMap `kwo-config` (kube-system)
+  - registry-enabled, registry-domain, registry-username, registry-certresolver
+- k3s config: `/etc/rancher/k3s/registries.yaml` (chmod 600)
+- Archive: `/var/lib/kwo/archive/registry-*` on credential rotation
+
+**Commands:**
+```bash
+kwo-registry status              # Show registry status and test endpoint
+kwo-registry get-credentials     # Display current credentials
+kwo-registry rotate-credentials  # Generate new password, update all configs
+```
+
+**Usage:**
+
+1. **Push images from external machine:**
+```bash
+# Login (prompted for password)
+docker login registry.example.com
+
+# Tag and push
+docker tag myapp:latest registry.example.com/myapp:latest
+docker push registry.example.com/myapp:latest
+```
+
+2. **Deploy in tenant (automatic pull):**
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+spec:
+  template:
+    spec:
+      # NO imagePullSecrets needed!
+      containers:
+        - image: registry.example.com/myapp:latest
+```
+
+3. **Credential rotation:**
+```bash
+# Rotates password, updates Secret, registries.yaml, restarts k3s
+sudo kwo-registry rotate-credentials
+```
+
+**Security:**
+- TLS-only access (Traefik auto-redirects HTTP→HTTPS)
+- bcrypt password hashing (htpasswd -B)
+- 32-character random passwords
+- Global k3s authentication (all tenants can pull)
+- Push access only via direct credentials (tenants cannot push)
+- Archived credentials (chmod 600) before rotation
+
+**Installation Flow:**
+
+During `./install.sh`:
+1. DNS providers configured first (required for TLS)
+2. Registry prompt appears (optional, can skip)
+3. Select domain (e.g., `registry.example.com`)
+4. Select DNS provider for certificate resolver
+5. Choose username (default: `docker`)
+6. Auto-generate random password
+7. Deploy registry (PVC, Deployment, Service, Ingress)
+8. Write `/etc/rancher/k3s/registries.yaml`
+9. Restart k3s
+10. Display credentials to user
+
+Re-running `./install.sh`:
+- Detects existing credentials
+- Prompts: "Regenerate password? [y/N]"
+- If yes: archives old, generates new, updates all configs
+- If no: reuses existing credentials
+
+**Non-Interactive Mode:**
+```bash
+sudo NON_INTERACTIVE=true \
+     REGISTRY_DOMAIN="registry.example.com" \
+     REGISTRY_USERNAME="docker" \
+     REGISTRY_CERT_RESOLVER="letsencrypt-cloudflare" \
+     ./install.sh
+
+# Skip registry entirely:
+sudo REGISTRY_SKIP="true" ./install.sh
 ```
 
 ---

@@ -21,3 +21,21 @@ validate_tenant_name() {
 get_kwo_version() {
     [ -f "/usr/share/kwo/VERSION" ] && cat /usr/share/kwo/VERSION || echo "unknown"
 }
+
+# Validate domain format (FQDN)
+validate_domain() {
+    local domain="$1"
+    [[ "$domain" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*$ ]]
+}
+
+# Generate 32-char random password (base64-safe, alphanumeric only)
+generate_password() {
+    openssl rand -base64 32 | tr -d '/+=' | head -c 32
+}
+
+# Create htpasswd bcrypt hash
+# Args: $1=username $2=password
+# Returns: username:$2y$...
+hash_password_bcrypt() {
+    htpasswd -Bbn "$1" "$2"
+}
