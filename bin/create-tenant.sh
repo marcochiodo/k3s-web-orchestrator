@@ -191,6 +191,14 @@ users:
     token: $TOKEN
 EOF
 
+chmod 600 "$KUBECONFIG_OUTPUT"
+
+# Generate JSON version (compact, no newlines)
+echo "Generating compact JSON version..."
+KUBECONFIG_JSON="${KUBECONFIG_OUTPUT%.yaml}.json"
+kubectl config view --kubeconfig="$KUBECONFIG_OUTPUT" --minify --raw -o json | jq -c '.' > "$KUBECONFIG_JSON"
+chmod 600 "$KUBECONFIG_JSON"
+
 # Test the kubeconfig
 echo ""
 echo "Testing kubeconfig..."
@@ -239,7 +247,8 @@ echo "Tenant: $TENANT"
 echo "Namespace: $TENANT"
 echo "ServiceAccount: $SA_NAME"
 echo "API Server: $SERVER"
-echo "Kubeconfig: $KUBECONFIG_OUTPUT"
+echo "Kubeconfig (YAML): $KUBECONFIG_OUTPUT"
+echo "Kubeconfig (JSON): $KUBECONFIG_JSON"
 echo ""
 echo "Next steps:"
 echo ""
@@ -248,9 +257,12 @@ echo "   export KUBECONFIG=$KUBECONFIG_OUTPUT"
 echo "   kubectl get pods"
 echo ""
 echo "2. Use in CI/CD (GitHub Actions):"
-echo "   # Encode the kubeconfig as base64"
-echo "   cat $KUBECONFIG_OUTPUT | base64 -w 0"
+echo "   # Option A: Use compact JSON directly"
+echo "   cat $KUBECONFIG_JSON"
 echo "   # Add the output as a secret: KUBECONFIG"
+echo ""
+echo "   # Option B: Use YAML with base64 encoding"
+echo "   cat $KUBECONFIG_OUTPUT | base64 -w 0"
 echo ""
 echo "3. Deploy an application:"
 echo "   # Edit examples/app.yaml to configure registry credentials (if needed)"

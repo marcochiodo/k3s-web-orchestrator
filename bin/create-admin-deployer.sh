@@ -125,11 +125,11 @@ rules:
       - horizontalpodautoscalers
     verbs: ["*"]
 
-  # Read-only access to namespaces (to list/view them)
+  # Namespace management
   - apiGroups: [""]
     resources:
       - namespaces
-    verbs: ["get", "list", "watch"]
+    verbs: ["get", "list", "watch", "create", "delete", "patch", "update"]
 EOF
 
 # 3. Bind ClusterRole to ServiceAccount
@@ -204,6 +204,12 @@ EOF
 
 chmod 600 "$KUBECONFIG_OUTPUT"
 
+# Generate JSON version (compact, no newlines)
+echo "Generating compact JSON version..."
+KUBECONFIG_JSON="${KUBECONFIG_OUTPUT%.yaml}.json"
+kubectl config view --kubeconfig="$KUBECONFIG_OUTPUT" --minify --raw -o json | jq -c '.' > "$KUBECONFIG_JSON"
+chmod 600 "$KUBECONFIG_JSON"
+
 # Test the kubeconfig
 echo ""
 echo "Testing kubeconfig..."
@@ -253,7 +259,8 @@ echo "Deployer: $DEPLOYER"
 echo "ServiceAccount: $SA_NAME"
 echo "Namespace: $NAMESPACE (account location)"
 echo "API Server: $SERVER"
-echo "Kubeconfig: $KUBECONFIG_OUTPUT"
+echo "Kubeconfig (YAML): $KUBECONFIG_OUTPUT"
+echo "Kubeconfig (JSON): $KUBECONFIG_JSON"
 echo ""
 echo "Next steps:"
 echo ""
@@ -264,7 +271,10 @@ echo "2. Or use it locally:"
 echo "   export KUBECONFIG=$KUBECONFIG_OUTPUT"
 echo "   kubectl get namespaces"
 echo ""
-echo "3. Deploy to any namespace:"
+echo "3. Use compact JSON in CI/CD (e.g., GitHub Actions secrets):"
+echo "   cat $KUBECONFIG_JSON"
+echo ""
+echo "4. Deploy to any namespace:"
 echo "   kubectl apply -f app.yaml -n tenant-a"
 echo "   kubectl apply -f app.yaml -n tenant-b"
 echo ""
@@ -275,7 +285,7 @@ echo "  ✓ Create and manage secrets and configmaps"
 echo "  ✓ Create ingresses (automatic TLS via Traefik)"
 echo "  ✓ Create cronjobs and jobs"
 echo "  ✓ List and view namespaces"
-echo "  ✗ Cannot create/delete namespaces"
+echo "  ✓ Create and delete namespaces"
 echo "  ✗ Cannot modify cluster-level resources (nodes, roles, etc.)"
 echo "  ✗ NOT cluster-admin (safer than full access)"
 echo ""
