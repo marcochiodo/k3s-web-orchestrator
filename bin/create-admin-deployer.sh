@@ -130,6 +130,16 @@ rules:
     resources:
       - namespaces
     verbs: ["get", "list", "watch", "create", "delete", "patch", "update"]
+  
+  # --- TRAEFIK CRDs (AGGIUNTO) ---
+  - apiGroups: ["traefik.io"]
+    resources:
+      - middlewares
+      - middlewaretcps
+      - ingressroutes
+      - traefikservices
+      - tlsoptions
+    verbs: ["*"]
 EOF
 
 # 3. Bind ClusterRole to ServiceAccount
@@ -286,6 +296,7 @@ echo "  ✓ Create ingresses (automatic TLS via Traefik)"
 echo "  ✓ Create cronjobs and jobs"
 echo "  ✓ List and view namespaces"
 echo "  ✓ Create and delete namespaces"
+echo "  ✓ Create Traefik Middlewares (redirects, auth, etc.)"
 echo "  ✗ Cannot modify cluster-level resources (nodes, roles, etc.)"
 echo "  ✗ NOT cluster-admin (safer than full access)"
 echo ""
