@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# DEPRECATED: Use 'kwo-delete-user <username>' instead
+# This script is kept for backward compatibility but will be removed in future versions
+echo "⚠ WARNING: This command is deprecated. Use 'kwo-delete-user <username>' instead." >&2
+echo "" >&2
+
 source /usr/share/kwo/bin/lib/common.sh 2>/dev/null || true
 
 TENANT="${1:-}"

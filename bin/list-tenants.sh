@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# DEPRECATED: Use 'kwo-list-users' instead
+# This script is kept for backward compatibility but will be removed in future versions
+echo "⚠ WARNING: This command is deprecated. Use 'kwo-list-users' instead." >&2
+echo "  You can filter by scope: kwo-list-users --scope=namespace-scoped" >&2
+echo "" >&2
+
 source /usr/share/kwo/bin/lib/common.sh 2>/dev/null || true
 
 FORMAT="table"

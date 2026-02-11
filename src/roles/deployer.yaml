@@ -1,0 +1,65 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kwo-deployer
+  labels:
+    managed-by: kwo
+    role-type: deployer
+rules:
+  # Core resources
+  - apiGroups: [""]
+    resources:
+      - pods
+      - pods/log
+      - pods/portforward
+      - services
+      - endpoints
+      - secrets
+      - configmaps
+      - persistentvolumeclaims
+    verbs: ["*"]
+
+  # Apps
+  - apiGroups: ["apps"]
+    resources:
+      - deployments
+      - statefulsets
+      - daemonsets
+      - replicasets
+    verbs: ["*"]
+
+  # Batch jobs
+  - apiGroups: ["batch"]
+    resources:
+      - jobs
+      - cronjobs
+    verbs: ["*"]
+
+  # Networking
+  - apiGroups: ["networking.k8s.io"]
+    resources:
+      - ingresses
+      - networkpolicies
+    verbs: ["*"]
+
+  # Autoscaling
+  - apiGroups: ["autoscaling"]
+    resources:
+      - horizontalpodautoscalers
+    verbs: ["*"]
+
+  # Namespace management
+  - apiGroups: [""]
+    resources:
+      - namespaces
+    verbs: ["get", "list", "watch", "create", "delete", "patch", "update"]
+
+  # Traefik CRDs
+  - apiGroups: ["traefik.io"]
+    resources:
+      - middlewares
+      - middlewaretcps
+      - ingressroutes
+      - traefikservices
+      - tlsoptions
+    verbs: ["*"]

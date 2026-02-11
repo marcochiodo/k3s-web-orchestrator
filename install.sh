@@ -803,7 +803,8 @@ install_kwo_system() {
 
     # 1. Crea struttura directory
     mkdir -p "$INSTALL_ROOT/bin/lib" "$STATE_ROOT/kubeconfigs" \
-             "$STATE_ROOT/metadata" "$STATE_ROOT/archive" "$LOG_ROOT"
+             "$STATE_ROOT/metadata/tenants" "$STATE_ROOT/metadata/users" \
+             "$STATE_ROOT/archive" "$LOG_ROOT"
 
     # 2. Imposta permessi base
     chown -R root:root "$INSTALL_ROOT" "$STATE_ROOT" "$LOG_ROOT"
@@ -837,6 +838,59 @@ install_kwo_system() {
     echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] install version=$KWO_VERSION user=$(whoami)" >> "$STATE_ROOT/install.log"
 
     log_info "KWO system installation complete"
+}
+
+# Cleanup deprecated files and symlinks
+cleanup_deprecated_files() {
+    log_info "Cleaning up deprecated files..."
+    
+    # Array of deprecated files and symlinks to remove
+    # Add new entries here when deprecating files in future updates
+    local deprecated_files=(
+        # Deprecated admin-deployer scripts (replaced by create-user.sh)
+        "/usr/share/kwo/bin/create-admin-deployer.sh"
+        "/usr/share/kwo/bin/delete-admin-deployer.sh"
+        "/usr/share/kwo/bin/list-admin-deployers.sh"
+        "/usr/local/bin/kwo-create-admin-deployer"
+        "/usr/local/bin/kwo-delete-admin-deployer"
+        "/usr/local/bin/kwo-list-admin-deployers"
+    )
+    
+    local removed_count=0
+    for file in "${deprecated_files[@]}"; do
+        if [ -e "$file" ] || [ -L "$file" ]; then
+            rm -f "$file"
+            log_info "Removed: $file"
+            removed_count=$((removed_count + 1))
+        fi
+    done
+    
+    if [ $removed_count -gt 0 ]; then
+        log_info "Cleaned up $removed_count deprecated file(s)"
+    else
+        log_info "No deprecated files found"
+    fi
+}
+
+# Apply cluster roles from src/roles/
+apply_cluster_roles() {
+    log_info "Applying cluster roles from src/roles/..."
+    local REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    local ROLES_DIR="$REPO_DIR/src/roles"
+    
+    if [ ! -d "$ROLES_DIR" ]; then
+        log_warn "No roles directory found at $ROLES_DIR"
+        return 0
+    fi
+    
+    for role_file in "$ROLES_DIR"/*.yaml; do
+        [ -f "$role_file" ] || continue
+        local role_name=$(basename "$role_file" .yaml)
+        log_info "Applying role: $role_name"
+        kubectl apply -f "$role_file"
+    done
+    
+    log_info "Cluster roles applied"
 }
 
 # Install or update a single script with checksum comparison
@@ -879,9 +933,9 @@ create_command_symlinks() {
         ["delete-tenant.sh"]="kwo-delete-tenant"
         ["list-tenants.sh"]="kwo-list-tenants"
         ["update-tenant.sh"]="kwo-update-tenant"
-        ["create-admin-deployer.sh"]="kwo-create-admin-deployer"
-        ["delete-admin-deployer.sh"]="kwo-delete-admin-deployer"
-        ["list-admin-deployers.sh"]="kwo-list-admin-deployers"
+        ["create-user.sh"]="kwo-create-user"
+        ["delete-user.sh"]="kwo-delete-user"
+        ["list-users.sh"]="kwo-list-users"
         ["status.sh"]="kwo-status"
         ["dns.sh"]="kwo-dns"
         ["check-tls.sh"]="kwo-check-tls"
@@ -1574,6 +1628,8 @@ main() {
     wait_for_traefik
     save_cluster_config
     install_kwo_system
+    cleanup_deprecated_files
+    apply_cluster_roles
     print_next_steps
 
     log_info "Installation complete!"

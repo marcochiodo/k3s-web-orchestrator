@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# DEPRECATED: Use 'kwo-create-user' (interactive) instead
+# This script is kept for backward compatibility but will be removed in future versions
+echo "⚠ WARNING: This command is deprecated. Use 'kwo-create-user' instead." >&2
+echo "  Run 'sudo kwo-create-user' and select namespaces when prompted." >&2
+echo "" >&2
+
 # Example: Create a tenant namespace with isolated RBAC
 # Usage: ./create-tenant.sh <tenant-name>
 #
