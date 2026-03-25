@@ -13,7 +13,8 @@
       "Bash(find:*)",
       "Bash(yamllint:*)",
       "Bash(python3:*)",
-      "Bash(scp:*)"
+      "Bash(scp:*)",
+      "Bash(git:*)"
     ],
     "deny": [],
     "ask": []
