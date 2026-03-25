@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(chmod:*)",
+      "WebFetch(domain:www.gnu.org)",
+      "Bash(ssh root@192.168.122.239 \"cd /srv/Work/Sys/k3s-web-orchestrator && bash -n install.sh && echo ''Syntax OK''\")",
+      "Bash(ssh:*)",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "Bash(grep:*)",
+      "Bash(ls:*)",
+      "Bash(bash -n:*)",
+      "Bash(find:*)",
+      "Bash(yamllint:*)",
+      "Bash(python3:*)",
+      "Bash(scp:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
