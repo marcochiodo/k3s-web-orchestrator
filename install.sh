@@ -1384,19 +1384,31 @@ configure_registry() {
         echo ""
         echo "=== Private Docker Registry Configuration ==="
         echo ""
-        echo "KWO can deploy a private Docker registry for your tenants."
-        echo "Features:"
-        echo "  - Automatic TLS via Traefik"
-        echo "  - htpasswd authentication"
-        echo "  - Global k3s integration (all tenants can pull)"
-        echo "  - 50Gi persistent storage"
-        echo ""
 
-        read -p "Configure private registry now? [Y/n]: " configure_registry_now
-
-        if [ "$configure_registry_now" = "n" ] || [ "$configure_registry_now" = "N" ]; then
-            log_info "Skipping registry configuration"
-            return 0
+        if [ -n "$existing_domain" ]; then
+            echo "Registry already configured:"
+            echo "  Domain:   $existing_domain"
+            echo "  Username: $existing_username"
+            echo "  Resolver: $existing_resolver"
+            echo ""
+            read -p "Modify registry configuration? [y/N]: " configure_registry_now
+            if [ "$configure_registry_now" != "y" ] && [ "$configure_registry_now" != "Y" ]; then
+                log_info "Keeping existing registry configuration"
+                return 0
+            fi
+        else
+            echo "KWO can deploy a private Docker registry for your tenants."
+            echo "Features:"
+            echo "  - Automatic TLS via Traefik"
+            echo "  - htpasswd authentication"
+            echo "  - Global k3s integration (all tenants can pull)"
+            echo "  - 50Gi persistent storage"
+            echo ""
+            read -p "Configure private registry now? [Y/n]: " configure_registry_now
+            if [ "$configure_registry_now" = "n" ] || [ "$configure_registry_now" = "N" ]; then
+                log_info "Skipping registry configuration"
+                return 0
+            fi
         fi
 
         # Prompt for registry domain
