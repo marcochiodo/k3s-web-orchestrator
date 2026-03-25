@@ -8,6 +8,8 @@ KWO is **not** a wrapper, CLI tool, or abstraction layer. It's a documented inst
 
 **What KWO provides:**
 - ✅ One-command k3s installation with Traefik configured for automatic Let's Encrypt
+- ✅ Built-in HTTP-01 resolver — works immediately for any domain pointing to the server, no DNS API credentials needed
+- ✅ Optional DNS-01 resolvers for wildcard certificates (Cloudflare, OVH, Route53, DigitalOcean)
 - ✅ Multi-tenant RBAC setup documentation
 - ✅ Seamless integration with external container registries
 - ✅ Copy-paste ready examples for common deployment patterns
@@ -24,8 +26,8 @@ KWO is **not** a wrapper, CLI tool, or abstraction layer. It's a documented inst
 
 - Fresh server running **Debian 12+**, **Ubuntu 22.04+**, or **Fedora 39+**
 - Root access
-- DNS provider account (Cloudflare, OVH, Route53, or DigitalOcean)
-- Domain name with DNS managed by one of the supported providers
+- A domain with an **A record pointing to this server** (required for Let's Encrypt HTTP-01)
+- *(Optional)* DNS provider account for wildcard certificates via DNS-01
 
 ### Installation
 
@@ -42,8 +44,8 @@ sudo ./install.sh
 
 The script will prompt you for:
 - Let's Encrypt notification email
-- DNS provider selection
-- DNS provider credentials
+- *(Optional)* DNS provider for wildcard certificates
+- *(Optional)* Private Docker registry configuration
 - Optional API endpoint domain
 
 3. Create your first tenant:
@@ -125,7 +127,8 @@ All commands require `sudo` for execution.
 │                                                                 │
 │  ┌───────────────────────────────────────────────────────────┐  │
 │  │  Traefik (kube-system)                                    │  │
-│  │  - Automatic Let's Encrypt via DNS-01                     │  │
+│  │  - HTTP-01 resolver (always active, no config needed)     │  │
+│  │  - DNS-01 resolvers (optional, per provider)              │  │
 │  │  - HTTP → HTTPS redirect                                  │  │
 │  │  - Routes traffic to tenant services                      │  │
 │  └─────────────────────────┬─────────────────────────────────┘  │
@@ -225,6 +228,47 @@ kubectl create secret docker-registry registry-credentials \
   --docker-username=myusername \
   --docker-password=mytoken
 ```
+
+## Certificate Resolvers
+
+KWO configures two types of Let's Encrypt certificate resolvers in Traefik.
+
+### HTTP-01 Resolver (always active)
+
+**Resolver name:** `letsencrypt`
+
+Available on every installation with no additional configuration. Works for any domain whose A record points directly to the server.
+
+```yaml
+# Ingress annotation
+traefik.ingress.kubernetes.io/router.tls.certresolver: letsencrypt
+```
+
+**Requirements:**
+- Port 80 must be reachable from the internet (Let's Encrypt connects to it)
+- Domain A record must point to this server
+
+**Limitations:**
+- Does not support wildcard certificates (`*.example.com`)
+- Requires the domain to be publicly reachable during certificate issuance
+
+### DNS-01 Resolvers (optional, per provider)
+
+**Resolver name:** `letsencrypt-<provider>` (e.g. `letsencrypt-cloudflare`, `letsencrypt-ovh-client-a`)
+
+Configured when you add a DNS provider via `kwo-dns add`. Required for wildcard certificates and useful when port 80 is not exposed.
+
+```yaml
+# Ingress annotation (DNS-01, e.g. for wildcard)
+traefik.ingress.kubernetes.io/router.tls.certresolver: letsencrypt-cloudflare
+```
+
+**When to use DNS-01:**
+- Wildcard certificates (`*.example.com`)
+- Server not reachable on port 80
+- CI/CD-driven cert issuance without live traffic
+
+---
 
 ## DNS Provider Setup
 
@@ -374,7 +418,7 @@ kubectl get pods,svc,ingress
 ```
 
 Traefik automatically:
-1. Requests Let's Encrypt certificate via DNS-01
+1. Requests Let's Encrypt certificate
 2. Configures HTTPS
 3. Redirects HTTP to HTTPS
 
@@ -473,18 +517,19 @@ kubectl logs -n kube-system -l app.kubernetes.io/name=traefik
 # Check Traefik logs for ACME errors
 kubectl logs -n kube-system -l app.kubernetes.io/name=traefik
 
-# Verify DNS credentials
-kubectl get secret dns-credentials -n kube-system
-
 # Check ingress annotations
 kubectl describe ingress myapp
 ```
 
-**Solutions:**
-- Verify DNS credentials are correct
-- Ensure domain points to your server's IP
-- Check DNS provider API rate limits
+**Solutions for HTTP-01 (`letsencrypt`):**
+- Ensure domain A record points to this server's IP
+- Ensure port 80 is reachable from the internet
 - Verify ingress has `certresolver: letsencrypt` annotation
+
+**Solutions for DNS-01 (`letsencrypt-<provider>`):**
+- Verify DNS provider credentials: `sudo kwo-dns check`
+- Check DNS provider API rate limits
+- Ensure the resolver name in the annotation matches a configured provider
 
 ### Pods not starting
 

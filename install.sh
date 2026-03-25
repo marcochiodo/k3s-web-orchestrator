@@ -360,9 +360,10 @@ configure_dns_providers() {
         echo ""
         echo "=== DNS Provider Configuration ==="
         echo ""
-        echo "Existing DNS providers:"
+        echo "Certificate resolvers:"
+        echo "  - letsencrypt (HTTP-01, always active — no credentials needed)"
         for provider in "${DNS_PROVIDER_LIST[@]}"; do
-            echo "  - letsencrypt-${provider}"
+            echo "  - letsencrypt-${provider} (DNS-01)"
         done
         echo ""
         read -p "Add another DNS provider? [y/N]: " add_more
@@ -402,18 +403,20 @@ configure_dns_providers() {
     echo ""
     echo "=== DNS Provider Configuration ==="
     echo ""
-    echo "KWO requires at least one DNS provider to issue Let's Encrypt certificates."
-    echo "You can configure DNS providers now or skip and configure them later."
+    echo "KWO always configures a 'letsencrypt' HTTP-01 resolver automatically."
+    echo "It works for any domain pointing directly to this server — no credentials needed."
     echo ""
-    read -p "Configure DNS providers now? [Y/n]: " configure_dns_now
+    echo "DNS providers are optional and only needed for:"
+    echo "  - Wildcard certificates (*.example.com)"
+    echo "  - Servers not reachable on port 80"
+    echo ""
+    read -p "Configure a DNS provider now? [y/N]: " configure_dns_now
 
-    if [ "$configure_dns_now" = "n" ] || [ "$configure_dns_now" = "N" ]; then
-        log_warn "Skipping DNS provider configuration"
-        log_warn "Automatic TLS certificates will NOT work until you configure at least one DNS provider."
+    if [ "$configure_dns_now" != "y" ] && [ "$configure_dns_now" != "Y" ]; then
+        log_info "Skipping DNS provider configuration"
+        log_info "HTTP-01 resolver 'letsencrypt' will be active for direct-pointed domains."
         echo ""
-        echo "To configure DNS providers after installation:"
-        echo "  sudo kwo-dns add cloudflare"
-        echo "  sudo kwo-dns add ovh --suffix=production"
+        echo "To add DNS providers later: sudo kwo-dns add <provider>"
         echo ""
         DNS_CONFIGURED=false
         return 0
@@ -564,63 +567,43 @@ create_dns_secret() {
 
 # Generate Traefik HelmChartConfig
 generate_traefik_config() {
-    if [ "$DNS_CONFIGURED" = false ]; then
-        log_info "Configuring Traefik without certificate resolvers"
+    local resolver_names="letsencrypt"
 
-        # Minimal config without cert resolvers
-        cat <<EOF | kubectl apply -f -
-apiVersion: helm.cattle.io/v1
-kind: HelmChartConfig
-metadata:
-  name: traefik
-  namespace: kube-system
-spec:
-  valuesContent: |-
-    persistence:
-      enabled: true
-    ports:
-      web:
-        redirections:
-          entryPoint:
-            to: websecure
-            scheme: https
-            permanent: true
-      websecure:
-        tls:
-          enabled: true
-EOF
-        log_info "Traefik HelmChartConfig applied (no DNS providers)"
-        return 0
-    fi
-
-    log_info "Configuring Traefik with ${#DNS_PROVIDER_LIST[@]} cert resolver(s)..."
-
+    # Always include HTTP-01 resolver (no DNS credentials needed, works for any
+    # domain that points directly to this server via A record)
     local additional_args=""
+    additional_args+="      - \"--certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL}\""$'\n'
+    additional_args+="      - \"--certificatesresolvers.letsencrypt.acme.storage=/data/acme.json\""$'\n'
+    additional_args+="      - \"--certificatesresolvers.letsencrypt.acme.httpchallenge=true\""$'\n'
+    additional_args+="      - \"--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web\""$'\n'
+
     local env_vars=""
 
-    # Generate cert resolver configuration for each provider
-    for provider in "${DNS_PROVIDER_LIST[@]}"; do
-        local resolver_name="letsencrypt-${provider}"
+    # Add DNS-01 resolvers for each configured provider
+    if [ "$DNS_CONFIGURED" = true ]; then
+        log_info "Configuring Traefik with HTTP-01 resolver + ${#DNS_PROVIDER_LIST[@]} DNS-01 resolver(s)..."
 
-        # Add cert resolver arguments
-        additional_args+="      - \"--certificatesresolvers.${resolver_name}.acme.email=${ACME_EMAIL}\""$'\n'
-        additional_args+="      - \"--certificatesresolvers.${resolver_name}.acme.storage=/data/acme-${provider}.json\""$'\n'
-        additional_args+="      - \"--certificatesresolvers.${resolver_name}.acme.dnschallenge=true\""$'\n'
-        additional_args+="      - \"--certificatesresolvers.${resolver_name}.acme.dnschallenge.provider=${provider}\""$'\n'
-        additional_args+="      - \"--certificatesresolvers.${resolver_name}.acme.dnschallenge.propagation.delayBeforeChecks=10\""$'\n'
-        additional_args+="      - \"--certificatesresolvers.${resolver_name}.acme.dnschallenge.resolvers=1.1.1.1:53,8.8.8.8:53\""$'\n'
+        for provider in "${DNS_PROVIDER_LIST[@]}"; do
+            local resolver_name="letsencrypt-${provider}"
+            resolver_names+=" $resolver_name"
 
-        # Add environment variables for credentials
-        case "$provider" in
-            cloudflare)
-                env_vars+='      - name: CF_DNS_API_TOKEN
+            additional_args+="      - \"--certificatesresolvers.${resolver_name}.acme.email=${ACME_EMAIL}\""$'\n'
+            additional_args+="      - \"--certificatesresolvers.${resolver_name}.acme.storage=/data/acme-${provider}.json\""$'\n'
+            additional_args+="      - \"--certificatesresolvers.${resolver_name}.acme.dnschallenge=true\""$'\n'
+            additional_args+="      - \"--certificatesresolvers.${resolver_name}.acme.dnschallenge.provider=${provider}\""$'\n'
+            additional_args+="      - \"--certificatesresolvers.${resolver_name}.acme.dnschallenge.propagation.delayBeforeChecks=10\""$'\n'
+            additional_args+="      - \"--certificatesresolvers.${resolver_name}.acme.dnschallenge.resolvers=1.1.1.1:53,8.8.8.8:53\""$'\n'
+
+            case "$provider" in
+                cloudflare)
+                    env_vars+='      - name: CF_DNS_API_TOKEN
         valueFrom:
           secretKeyRef:
             name: dns-credentials
             key: CF_DNS_API_TOKEN'$'\n'
-                ;;
-            ovh)
-                env_vars+='      - name: OVH_ENDPOINT
+                    ;;
+                ovh)
+                    env_vars+='      - name: OVH_ENDPOINT
         valueFrom:
           secretKeyRef:
             name: dns-credentials
@@ -640,9 +623,9 @@ EOF
           secretKeyRef:
             name: dns-credentials
             key: OVH_CONSUMER_KEY'$'\n'
-                ;;
-            route53)
-                env_vars+='      - name: AWS_ACCESS_KEY_ID
+                    ;;
+                route53)
+                    env_vars+='      - name: AWS_ACCESS_KEY_ID
         valueFrom:
           secretKeyRef:
             name: dns-credentials
@@ -657,16 +640,26 @@ EOF
           secretKeyRef:
             name: dns-credentials
             key: AWS_REGION'$'\n'
-                ;;
-            digitalocean)
-                env_vars+='      - name: DO_AUTH_TOKEN
+                    ;;
+                digitalocean)
+                    env_vars+='      - name: DO_AUTH_TOKEN
         valueFrom:
           secretKeyRef:
             name: dns-credentials
             key: DO_AUTH_TOKEN'$'\n'
-                ;;
-        esac
-    done
+                    ;;
+            esac
+        done
+    else
+        log_info "Configuring Traefik with HTTP-01 resolver only (no DNS providers configured)"
+    fi
+
+    # Build env section only if there are env vars
+    local env_section=""
+    if [ -n "$env_vars" ]; then
+        env_section="    env:
+${env_vars}"
+    fi
 
     cat <<EOF | kubectl apply -f -
 apiVersion: helm.cattle.io/v1
@@ -680,8 +673,7 @@ spec:
       enabled: true
     additionalArguments:
 ${additional_args}
-    env:
-${env_vars}
+${env_section}
     ports:
       web:
         redirections:
@@ -694,7 +686,7 @@ ${env_vars}
           enabled: true
 EOF
 
-    log_info "Traefik HelmChartConfig applied with resolvers: ${DNS_PROVIDER_LIST[*]}"
+    log_info "Traefik HelmChartConfig applied with resolvers: ${resolver_names}"
 }
 
 # Wait for Traefik to restart
