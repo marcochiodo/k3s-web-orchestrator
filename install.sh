@@ -824,6 +824,15 @@ install_kwo_system() {
         fi
     fi
 
+    # 3b. Installa roles
+    if [ -d "$REPO_DIR/src/roles" ]; then
+        mkdir -p "$INSTALL_ROOT/roles"
+        for role_file in "$REPO_DIR/src/roles"/*.yaml; do
+            [ -f "$role_file" ] && cp "$role_file" "$INSTALL_ROOT/roles/$(basename "$role_file")"
+        done
+        chmod 644 "$INSTALL_ROOT/roles"/*.yaml 2>/dev/null || true
+    fi
+
     # 4. Scrivi versione
     echo "$KWO_VERSION" > "$INSTALL_ROOT/VERSION"
 
