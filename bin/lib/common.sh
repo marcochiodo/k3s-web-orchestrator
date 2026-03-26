@@ -39,3 +39,26 @@ generate_password() {
 hash_password_bcrypt() {
     htpasswd -Bbn "$1" "$2"
 }
+
+# Check available disk space on a given path
+# Args: $1=path $2=required_mb $3=context (e.g. "installation")
+# Exits with error if space is insufficient
+check_disk_space() {
+    local path="$1"
+    local required_mb="$2"
+    local context="${3:-operation}"
+    local available_mb
+    available_mb=$(df -m "$path" 2>/dev/null | awk 'NR==2 {print $4}')
+    if [ -z "$available_mb" ]; then
+        log_warn "Could not check disk space on $path"
+        return 0
+    fi
+    if [ "$available_mb" -lt "$required_mb" ]; then
+        log_error "Insufficient disk space for $context"
+        log_error "  Path:      $path"
+        log_error "  Available: ${available_mb}MB"
+        log_error "  Required:  ${required_mb}MB"
+        exit 1
+    fi
+    log_info "Disk space OK: ${available_mb}MB available on $path (need ${required_mb}MB)"
+}

@@ -400,6 +400,21 @@ sudo REGISTRY_SKIP="true" ./install.sh
 
 ---
 
+## Development Guidelines
+
+### README.md Must Stay in Sync
+
+Any change that affects user-facing behavior **must** include a corresponding README.md update in the same task:
+
+- New command or script → add to Command Reference
+- New feature or option → document in the relevant section
+- Changed behavior or defaults → update existing documentation
+- New requirement or prerequisite → update Prerequisites
+
+This is not optional. README.md is the user's only reference and must reflect the current state of the codebase at all times.
+
+---
+
 ## License
 
 GPL-3.0

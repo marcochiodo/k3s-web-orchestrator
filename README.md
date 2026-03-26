@@ -110,6 +110,12 @@ sudo kwo-dns list
 sudo kwo-dns check
 ```
 
+**k3s Maintenance:**
+- `kwo-update-k3s` - Upgrade k3s to the latest stable version
+- `kwo-update-k3s --version=vX.Y.Z+k3sN` - Upgrade to a specific version
+- `kwo-update-k3s --channel=v1.32` - Upgrade to latest on a minor-version channel
+- `kwo-cleanup-k3s` - Free disk space: remove previous k3s version data and prune unused images
+
 **Diagnostics:**
 - `kwo-status` - Show cluster health and status
 - `kwo-check-tls <domain>` - Check certificate status for a domain
@@ -568,13 +574,58 @@ The installer will:
 
 ### k3s
 
+Use `kwo-update-k3s` to safely upgrade k3s. The tool checks the version gap, blocks skipped minor versions, warns about breaking changes, and takes a backup before proceeding.
+
 ```bash
 # Check current version
 k3s --version
 
-# Upgrade (as root)
-curl -sfL https://get.k3s.io | sh -
-sudo systemctl restart k3s
+# Upgrade to latest stable (interactive)
+sudo kwo-update-k3s
+
+# Upgrade to a specific version
+sudo kwo-update-k3s --version=v1.32.3+k3s1
+
+# Upgrade to latest on a minor-version channel
+sudo kwo-update-k3s --channel=v1.32
+
+# Non-interactive (e.g. automation)
+sudo kwo-update-k3s --yes
+```
+
+**Version format:** `v1.31.4+k3s1` — follows Kubernetes versioning (`major.minor.patch`) plus a k3s release suffix.
+
+**Upgrade rules:**
+
+| Type | Example | Behaviour |
+|------|---------|-----------|
+| Patch | `1.31.3` → `1.31.4` | Safe, no warnings |
+| k3s release | `+k3s1` → `+k3s2` | Safe, no warnings |
+| Minor (+1) | `1.31` → `1.32` | Allowed, may warn about breaking changes |
+| Minor skip | `1.31` → `1.33` | **Blocked** — upgrade one minor at a time |
+| Downgrade | `1.32` → `1.31` | **Blocked** |
+
+**Traefik v2 → v3 (k3s 1.31 → 1.32):**
+
+k3s 1.32 ships Traefik v3. KWO's ACME resolver config is reapplied automatically, but custom Traefik `Middleware` or `IngressRoute` resources may need review. See [Traefik v2→v3 migration guide](https://doc.traefik.io/traefik/migration/v2-v3/).
+
+**Backup:** Before each upgrade, `kwo-update-k3s` saves an etcd snapshot or SQLite copy to `/var/lib/kwo/backups/`.
+
+**Disk space:** each upgrade keeps the previous version's data (~230MB) for rollback. Once you are satisfied with the upgrade, reclaim that space:
+
+```bash
+sudo kwo-cleanup-k3s
+```
+
+`kwo-status` will warn you when disk usage is above 70% and indicate how much space is recoverable.
+
+**Upgrading across multiple minor versions** (e.g. 1.31 → 1.35):
+
+```bash
+sudo kwo-update-k3s --channel=v1.32 --yes
+sudo kwo-update-k3s --channel=v1.33 --yes
+sudo kwo-update-k3s --channel=v1.34 --yes
+sudo kwo-update-k3s --yes   # latest stable
 ```
 
 ### Traefik

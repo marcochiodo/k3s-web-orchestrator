@@ -8,6 +8,11 @@ SCRIPT_VERSION="1.2.0"
 K3S_VERSION="${K3S_VERSION:-}"  # Empty = latest stable
 KUBECONFIG="${KUBECONFIG:-/etc/rancher/k3s/k3s.yaml}"
 
+# Global state — initialized here so they are always defined under set -u
+DNS_CONFIGURED=false
+DNS_PROVIDER_LIST=()
+declare -A DNS_CREDS
+
 # Color output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -24,6 +29,19 @@ log_warn() {
 
 log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
+}
+
+check_disk_space() {
+    local path="$1" required_mb="$2" context="${3:-operation}"
+    local available_mb
+    available_mb=$(df -m "$path" 2>/dev/null | awk 'NR==2 {print $4}')
+    if [ -z "$available_mb" ]; then log_warn "Could not check disk space on $path"; return 0; fi
+    if [ "$available_mb" -lt "$required_mb" ]; then
+        log_error "Insufficient disk space for $context"
+        log_error "  Available: ${available_mb}MB on $path — Required: ${required_mb}MB"
+        exit 1
+    fi
+    log_info "Disk space OK: ${available_mb}MB available on $path (need ${required_mb}MB)"
 }
 
 # Validate domain format (FQDN)
@@ -79,10 +97,10 @@ install_prerequisites() {
         apt-get)
             export DEBIAN_FRONTEND=noninteractive
             apt-get update -qq
-            apt-get install -y -qq curl iptables jq apache2-utils
+            apt-get install -y -qq curl iptables jq apache2-utils sqlite3
             ;;
         dnf)
-            dnf install -y -q curl iptables jq httpd-tools
+            dnf install -y -q curl iptables jq httpd-tools sqlite
             ;;
     esac
 
@@ -139,6 +157,65 @@ configure_hostname() {
 }
 
 # Install k3s
+prompt_k3s_version() {
+    # Only relevant on fresh install and interactive mode
+    command -v k3s &>/dev/null && return 0
+    [ "${NON_INTERACTIVE:-false}" = "true" ] && return 0
+
+    log_info "Fetching latest stable k3s version..."
+    local stable
+    stable=$(curl -sfL --max-time 10 https://update.k3s.io/v1-release/channels/stable \
+        -o /dev/null -w '%{url_effective}' 2>/dev/null \
+        | grep -oP 'v[0-9]+\.[0-9]+\.[0-9]+\+k3s[0-9]+' || echo "")
+
+    echo ""
+    echo "=== k3s Version ==="
+    echo ""
+
+    if [ -n "$stable" ]; then
+        echo "  1) Latest stable: ${stable}  [default]"
+    else
+        echo "  1) Latest stable  [default]"
+    fi
+    echo "  2) Specific minor channel (e.g. v1.33, v1.34)"
+    echo "  3) Specific version (manual input)"
+    echo ""
+    read -p "Select [1]: " version_choice
+    version_choice="${version_choice:-1}"
+
+    case "$version_choice" in
+        1)
+            # Use latest stable — leave K3S_VERSION empty so installer picks it up
+            K3S_VERSION=""
+            [ -n "$stable" ] && log_info "Will install: ${stable}"
+            ;;
+        2)
+            read -p "Minor channel (e.g. v1.33): " minor_channel
+            local channel_version
+            channel_version=$(curl -sfL --max-time 10 \
+                "https://update.k3s.io/v1-release/channels/${minor_channel}" \
+                -o /dev/null -w '%{url_effective}' 2>/dev/null \
+                | grep -oP 'v[0-9]+\.[0-9]+\.[0-9]+\+k3s[0-9]+' || echo "")
+            if [ -z "$channel_version" ]; then
+                log_error "Could not resolve channel '${minor_channel}'"
+                log_error "Check available channels: https://update.k3s.io/v1-release/channels"
+                exit 1
+            else
+                K3S_VERSION="$channel_version"
+                log_info "Will install: ${K3S_VERSION}"
+            fi
+            ;;
+        3)
+            read -p "Version (e.g. v1.33.9+k3s1): " K3S_VERSION
+            log_info "Will install: ${K3S_VERSION}"
+            ;;
+        *)
+            log_warn "Invalid choice — using latest stable"
+            K3S_VERSION=""
+            ;;
+    esac
+}
+
 install_k3s() {
     if command -v k3s &> /dev/null; then
         log_warn "k3s is already installed. Skipping installation."
@@ -149,13 +226,12 @@ install_k3s() {
 
     local k3s_args="--write-kubeconfig-mode 644"
 
-    # Add TLS SAN for API domain if configured
     if [ -n "${API_DOMAIN:-}" ]; then
         log_info "Adding TLS SAN for: $API_DOMAIN"
         k3s_args="$k3s_args --tls-san $API_DOMAIN"
     fi
 
-    if [ -n "$K3S_VERSION" ]; then
+    if [ -n "${K3S_VERSION:-}" ]; then
         curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="${K3S_VERSION}" sh -s - $k3s_args
     else
         curl -sfL https://get.k3s.io | sh -s - $k3s_args
@@ -794,7 +870,7 @@ save_initial_dns_metadata() {
 install_kwo_system() {
     log_info "Installing KWO system files..."
 
-    local KWO_VERSION="1.2.0"
+    local KWO_VERSION="1.3.0"
     local INSTALL_ROOT="/usr/share/kwo"
     local STATE_ROOT="/var/lib/kwo"
     local LOG_ROOT="/var/log/kwo"
@@ -804,12 +880,12 @@ install_kwo_system() {
     # 1. Crea struttura directory
     mkdir -p "$INSTALL_ROOT/bin/lib" "$STATE_ROOT/kubeconfigs" \
              "$STATE_ROOT/metadata/tenants" "$STATE_ROOT/metadata/users" \
-             "$STATE_ROOT/archive" "$LOG_ROOT"
+             "$STATE_ROOT/archive" "$STATE_ROOT/backups" "$LOG_ROOT"
 
     # 2. Imposta permessi base
     chown -R root:root "$INSTALL_ROOT" "$STATE_ROOT" "$LOG_ROOT"
     chmod 755 "$INSTALL_ROOT" "$STATE_ROOT" "$LOG_ROOT"
-    chmod 700 "$STATE_ROOT/archive" "$STATE_ROOT/kubeconfigs"
+    chmod 700 "$STATE_ROOT/archive" "$STATE_ROOT/kubeconfigs" "$STATE_ROOT/backups"
 
     # 3. Installa/aggiorna script con checksum
     if [ -d "$REPO_DIR/bin" ]; then
@@ -945,6 +1021,8 @@ create_command_symlinks() {
         ["create-user.sh"]="kwo-create-user"
         ["delete-user.sh"]="kwo-delete-user"
         ["list-users.sh"]="kwo-list-users"
+        ["update-k3s.sh"]="kwo-update-k3s"
+        ["cleanup-k3s.sh"]="kwo-cleanup-k3s"
         ["status.sh"]="kwo-status"
         ["dns.sh"]="kwo-dns"
         ["check-tls.sh"]="kwo-check-tls"
@@ -1638,8 +1716,10 @@ main() {
 
     detect_os
     install_prerequisites
+    check_disk_space "/" 2048 "KWO installation"
     prompt_config
     configure_hostname
+    prompt_k3s_version
     install_k3s
     wait_for_k3s
     configure_dns_providers
