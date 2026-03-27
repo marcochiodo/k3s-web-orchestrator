@@ -760,6 +760,9 @@ ${env_section}
       websecure:
         tls:
           enabled: true
+    service:
+      spec:
+        externalTrafficPolicy: Local
 EOF
 
     log_info "Traefik HelmChartConfig applied with resolvers: ${resolver_names}"
