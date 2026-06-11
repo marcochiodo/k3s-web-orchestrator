@@ -10,7 +10,8 @@ KWO is **not** a wrapper, CLI tool, or abstraction layer. It's a documented inst
 - ✅ One-command k3s installation with Traefik configured for automatic Let's Encrypt
 - ✅ Built-in HTTP-01 resolver — works immediately for any domain pointing to the server, no DNS API credentials needed
 - ✅ Optional DNS-01 resolvers for wildcard certificates (Cloudflare, OVH, Route53, DigitalOcean)
-- ✅ Multi-tenant RBAC setup documentation
+- ✅ Multi-tenant isolation: tenant namespaces + role-scoped users with their own kubeconfig
+- ✅ Optional built-in private Docker registry with automatic TLS (no `imagePullSecrets` needed)
 - ✅ Seamless integration with external container registries
 - ✅ Copy-paste ready examples for common deployment patterns
 
@@ -48,20 +49,22 @@ The script will prompt you for:
 - *(Optional)* Private Docker registry configuration
 - Optional API endpoint domain
 
-3. Create your first tenant:
+3. Create your first tenant (namespace):
 ```bash
-kwo-create-tenant mytenant
+sudo kwo-create-tenant mytenant
 # Kubeconfig saved to: /var/lib/kwo/kubeconfigs/mytenant-kubeconfig.yaml
 ```
 
-4. List tenants:
+4. (Optional) Create a user scoped to it for a person or CI pipeline:
 ```bash
-kwo-list-tenants
+sudo kwo-create-user
+# username: alice  ·  role: deployer  ·  namespaces: mytenant
+# Kubeconfig saved to: /var/lib/kwo/kubeconfigs/user-alice-kubeconfig.yaml
 ```
 
 5. Check cluster status:
 ```bash
-kwo-status
+sudo kwo-status
 ```
 
 6. Deploy an application:
@@ -75,15 +78,31 @@ kubectl apply -f examples/app.yaml
 
 That's it! Your application is now running with automatic HTTPS.
 
+See [Tenants and Users](#tenants-and-users) for how tenants and users relate.
+
 ## Command Reference
 
-After installation, the following commands are available:
+After installation, the following commands are available. All commands require `sudo`.
 
-**Tenant Management:**
-- `kwo-create-tenant <name>` - Create a new isolated tenant namespace
-- `kwo-delete-tenant <name>` - Delete tenant (archives data by default)
+**Tenant Management** (a tenant is an isolated namespace):
+- `kwo-create-tenant <name>` - Create a tenant namespace with a scoped `deployer` ServiceAccount and kubeconfig
+- `kwo-delete-tenant <name> [--force] [--no-archive]` - Delete tenant namespace (archives data by default)
 - `kwo-list-tenants` - List all tenants with resource counts
-- `kwo-update-tenant <name> --rotate-token` - Rotate ServiceAccount token
+- `kwo-update-tenant <name> --rotate-token` - Rotate the tenant ServiceAccount token
+
+**User Management** (a user is an access principal with a role and a scope):
+- `kwo-create-user` - Interactive: prompts for username, role, and namespace scope, then emits a kubeconfig
+- `kwo-delete-user <name> [--force] [--no-archive]` - Delete user (ServiceAccount + bindings; archives by default)
+- `kwo-list-users [--format=table|json] [--role=<role>] [--scope=cluster-wide|namespace-scoped]` - List users
+
+Users get a role (currently `deployer`) and a scope:
+- **Global** (leave namespaces empty) → `ClusterRoleBinding`, access to all namespaces, can create/delete namespaces
+- **Namespace-scoped** (comma-separated list) → `RoleBinding` per namespace
+
+**Registry Management** (built-in private Docker registry):
+- `kwo-registry status` - Show registry status and test the endpoint
+- `kwo-registry get-credentials` - Display the current username/password and `docker login` command
+- `kwo-registry rotate-credentials` - Generate a new password and update Secret, `registries.yaml`, and restart k3s
 
 **DNS Provider Management:**
 - `kwo-dns add <provider> [--suffix=<name>] [--non-interactive]` - Add DNS provider
@@ -123,8 +142,6 @@ sudo kwo-dns check
 - `kwo-check-tls <domain>` - Check certificate status for a domain
 - `kwo-logs <component>` - View logs (traefik, k3s, tenant:name)
 
-All commands require `sudo` for execution.
-
 ## Architecture
 
 ```
@@ -151,61 +168,90 @@ All commands require `sudo` for execution.
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-## Container Registry Integration
+## Private Docker Registry (built-in)
 
-KWO integrates seamlessly with external container registries. During tenant creation, you can configure registry credentials that are:
-- **Stored as Kubernetes Secrets** in the tenant namespace
-- **Automatically used by pods** for pulling images (imagePullSecrets)
-- **Extracted by CI/CD** for docker push operations
+KWO can deploy its own private Docker registry inside the cluster, with automatic TLS and authentication. This is **optional** and configured during `install.sh` (you can skip it).
 
-**Zero registry credentials in GitHub!** Only the kubeconfig is needed.
+**Features:**
+- Automatic TLS via Traefik — **HTTP-01 (`letsencrypt`) by default, no DNS provider required**, or a DNS-01 resolver if you prefer
+- `htpasswd` authentication (bcrypt)
+- Global k3s integration via `/etc/rancher/k3s/registries.yaml` — **all tenants can pull without `imagePullSecrets`**
+- 50Gi persistent storage (`local-path`)
 
-### Supported Registries
+### Configuring the registry
 
-- **GitHub Container Registry (ghcr.io)** - Free for public repos
-- **Docker Hub (docker.io)** - Free tier available
-- **Private registries** - Any Docker Registry v2 compatible
+During `install.sh`, after the (optional) DNS step, you are prompted to configure the registry:
 
-### Setup During Tenant Creation
+```
+Registry domain (e.g., registry.example.com): registry.example.com
+Select resolver [1-N, default 1]: 1        # 1) letsencrypt (HTTP-01)
+Registry username [docker]: docker
+```
 
-When running `create-tenant.sh`, you'll be prompted for registry credentials:
+The installer generates a random 32-character password and prints it once. Point `registry.example.com`'s A record at the server so HTTP-01 can issue the certificate.
+
+Non-interactive install:
 
 ```bash
-./bin/create-tenant.sh mytenant
+# Default HTTP-01 resolver (no DNS provider needed):
+sudo NON_INTERACTIVE=true \
+     REGISTRY_DOMAIN="registry.example.com" \
+     REGISTRY_USERNAME="docker" \
+     ./install.sh
 
-# Prompts:
-# Registry server (e.g., ghcr.io, docker.io): ghcr.io
-# Registry username: myusername
-# Registry password: ****
+# Use a DNS-01 resolver instead:
+sudo NON_INTERACTIVE=true \
+     REGISTRY_DOMAIN="registry.example.com" \
+     REGISTRY_CERT_RESOLVER="letsencrypt-cloudflare" \
+     ./install.sh
+
+# Skip the registry entirely:
+sudo REGISTRY_SKIP="true" ./install.sh
 ```
 
-This creates a `registry-credentials` secret in the tenant namespace.
+### Managing the registry
 
-### Using the Registry in CI/CD
+```bash
+sudo kwo-registry status              # Status + endpoint test
+sudo kwo-registry get-credentials     # Show username/password and docker login command
+sudo kwo-registry rotate-credentials  # New password, updates Secret + registries.yaml, restarts k3s
+```
 
-**No separate registry secrets needed!** CI/CD extracts credentials from Kubernetes:
+### Pushing and pulling
+
+```bash
+# Push from any machine (credentials from get-credentials)
+docker login registry.example.com
+docker tag myapp:latest registry.example.com/myapp:latest
+docker push registry.example.com/myapp:latest
+```
+
+Tenants pull **without** any `imagePullSecrets` — k3s is globally authenticated:
 
 ```yaml
-# .github/workflows/deploy.yml
-- name: Login to container registry
-  run: |
-    # Extract from Kubernetes secret
-    DOCKER_CONFIG=$(kubectl get secret registry-credentials \
-      -o jsonpath='{.data.\.dockerconfigjson}' | base64 -d)
-    mkdir -p ~/.docker
-    echo "$DOCKER_CONFIG" > ~/.docker/config.json
-
-- name: Build and push
-  run: |
-    docker build -t ghcr.io/myuser/myapp:latest .
-    docker push ghcr.io/myuser/myapp:latest
+apiVersion: apps/v1
+kind: Deployment
+spec:
+  template:
+    spec:
+      # No imagePullSecrets needed
+      containers:
+        - name: myapp
+          image: registry.example.com/myapp:latest
 ```
 
-See `examples/github-actions/deploy.yml` for complete examples.
+## External Container Registries
 
-### Using Images with imagePullSecrets
+You can also pull from external registries (ghcr.io, Docker Hub, etc.). For **private** external images, create a `docker-registry` secret in the tenant namespace and reference it with `imagePullSecrets`:
 
-Reference the secret in your deployments:
+```bash
+export KUBECONFIG=./mytenant-kubeconfig.yaml
+
+kubectl create secret docker-registry registry-credentials \
+  --docker-server=ghcr.io \
+  --docker-username=myusername \
+  --docker-password=mytoken
+```
 
 ```yaml
 apiVersion: apps/v1
@@ -222,18 +268,26 @@ spec:
           image: ghcr.io/myuser/myapp:latest
 ```
 
-### Manual Registry Setup
+### Building and pushing in CI/CD
 
-If you skipped registry setup during tenant creation:
+CI/CD can read the same secret from Kubernetes instead of storing registry credentials in GitHub:
 
-```bash
-export KUBECONFIG=./mytenant-kubeconfig.yaml
+```yaml
+# .github/workflows/deploy.yml
+- name: Login to container registry
+  run: |
+    DOCKER_CONFIG=$(kubectl get secret registry-credentials \
+      -o jsonpath='{.data.\.dockerconfigjson}' | base64 -d)
+    mkdir -p ~/.docker
+    echo "$DOCKER_CONFIG" > ~/.docker/config.json
 
-kubectl create secret docker-registry registry-credentials \
-  --docker-server=ghcr.io \
-  --docker-username=myusername \
-  --docker-password=mytoken
+- name: Build and push
+  run: |
+    docker build -t ghcr.io/myuser/myapp:latest .
+    docker push ghcr.io/myuser/myapp:latest
 ```
+
+See `examples/github-actions/deploy.yml` for complete examples.
 
 ## Certificate Resolvers
 
@@ -365,46 +419,69 @@ sudo kwo-dns add ovh --suffix=production
 2. Generate new token with **Write** scope
 3. Use the token during installation
 
-## Tenant Management
+## Tenants and Users
 
-### Creating a Tenant
+KWO separates **what** workloads run from **who** can manage them:
 
-Tenants are isolated namespaces with dedicated RBAC permissions:
+- **Tenant** = an isolated namespace. Workloads (Deployments, Services, Ingresses, …) live here.
+- **User** = an access principal (a ServiceAccount in `kube-system`) bound to a **role** with a **scope**. A user receives a kubeconfig.
+
+A single user can be scoped to one tenant, several tenants, or the whole cluster. This is more flexible than one-kubeconfig-per-namespace: you grant a person or CI pipeline exactly the namespaces it needs.
+
+### Creating a Tenant (namespace)
 
 ```bash
-./bin/create-tenant.sh <tenant-name>
+sudo kwo-create-tenant <tenant-name>
 ```
 
-This creates:
-- Namespace
-- ServiceAccount with namespace-scoped permissions
-- Kubeconfig file for CI/CD
+This creates the namespace plus a namespace-scoped `deployer` ServiceAccount and a kubeconfig (useful for a single-namespace CI pipeline). A **global** user with the `deployer` role can also create namespaces directly with `kubectl create namespace`.
 
-### Tenant Permissions
+### Creating a User
 
-Each tenant can:
-- ✅ Deploy applications (Deployments, StatefulSets)
-- ✅ Create Services and Ingresses
-- ✅ Manage Secrets and ConfigMaps
-- ✅ Create CronJobs and Jobs
-- ✅ View logs
+`kwo-create-user` is interactive and walks you through three choices:
 
-Each tenant **cannot**:
-- ❌ Access other namespaces
-- ❌ View or modify cluster-level resources
-- ❌ See other tenants' workloads
+```bash
+sudo kwo-create-user
+# 1. Enter username:        alice
+# 2. Select role:           deployer
+# 3. Namespaces [global]:   app-a,app-b      # empty = global (all namespaces)
+```
 
-### Using the Tenant Kubeconfig
+Result:
+- **Global scope** (empty namespaces) → a `ClusterRoleBinding` to `kwo-deployer`; the user can manage every namespace and create/delete namespaces.
+- **Namespace scope** (comma-separated) → a `RoleBinding` to `kwo-deployer` in each listed namespace only.
+
+The generated kubeconfig is written to `/var/lib/kwo/kubeconfigs/user-<name>-kubeconfig.yaml` (plus a compact `.json` for CI/CD).
+
+```bash
+sudo kwo-list-users                       # table view
+sudo kwo-list-users --scope=cluster-wide  # filter
+sudo kwo-delete-user alice                # archives bindings + kubeconfig, then removes them
+```
+
+> Note: `kwo-create-tenant`/`kwo-update-tenant` predate the role-based user model. The combined namespace-and-kubeconfig flow still works, but for granting people or pipelines access prefer `kwo-create-user`.
+
+### Roles
+
+Roles are `ClusterRole`s applied from `src/roles/*.yaml` during install (named `kwo-<role>`). The bundled `deployer` role can:
+- ✅ Manage pods, deployments, statefulsets, daemonsets, services, ingresses
+- ✅ Manage secrets, configmaps, PVCs, cronjobs/jobs, HPAs
+- ✅ Manage Traefik CRDs (middlewares, ingressroutes, …)
+- ✅ Create/delete namespaces (global scope only)
+- ❌ Modify cluster-level resources outside its role (RBAC, nodes, …)
+
+Add your own role by dropping a `ClusterRole` YAML into `src/roles/` and re-running `sudo ./install.sh`.
+
+### Using the Kubeconfig
 
 ```bash
 # Local development
-export KUBECONFIG=./mytenant-kubeconfig.yaml
-kubectl get pods
+export KUBECONFIG=/var/lib/kwo/kubeconfigs/user-alice-kubeconfig.yaml
+kubectl get pods -n app-a
 
-# CI/CD (GitHub Actions, GitLab CI, etc.)
-# Encode as base64:
-cat mytenant-kubeconfig.yaml | base64 -w 0
-# Add as secret: KUBECONFIG
+# CI/CD (GitHub Actions, GitLab CI, etc.) — use the compact JSON:
+cat /var/lib/kwo/kubeconfigs/user-alice-kubeconfig.json
+# Add the output as a secret: KUBECONFIG
 ```
 
 ## Deployment Example
@@ -698,8 +775,9 @@ This removes:
 
 ## Security Considerations
 
-- **Tenant isolation:** Tenants cannot access other namespaces (enforced by RBAC)
+- **Tenant isolation:** Namespace-scoped users cannot access namespaces outside their grant (enforced by RBAC). Only global-scope users can reach all namespaces.
 - **TLS certificates:** Automatically managed by Let's Encrypt
+- **Registry credentials:** The built-in registry uses bcrypt htpasswd; rotate with `kwo-registry rotate-credentials`
 - **Secrets:** Store sensitive data in Kubernetes Secrets (base64 encoded, not encrypted at rest by default)
 - **Network policies:** Not configured by default (add if needed)
 - **API server:** Exposed on port 6443 (configure firewall as needed)
@@ -713,16 +791,27 @@ kwo/
 ├── README.md                     # This file
 ├── LICENSE                       # GPL-3.0
 ├── bin/
-│   ├── create-tenant.sh          # Tenant management scripts
+│   ├── create-tenant.sh          # Tenant (namespace) management
 │   ├── delete-tenant.sh
 │   ├── list-tenants.sh
 │   ├── update-tenant.sh
-│   ├── status.sh                 # Diagnostic scripts
-│   ├── check-dns.sh
+│   ├── create-user.sh            # User (access principal) management
+│   ├── delete-user.sh
+│   ├── list-users.sh
+│   ├── dns.sh                    # DNS provider management
+│   ├── registry.sh              # Private registry management
+│   ├── update-k3s.sh            # k3s maintenance
+│   ├── cleanup-k3s.sh
+│   ├── status.sh                 # Diagnostics
 │   ├── check-tls.sh
 │   ├── logs.sh
 │   └── lib/
-│       └── common.sh             # Shared functions
+│       ├── common.sh             # Shared functions
+│       ├── dns-helpers.sh
+│       └── registry-helpers.sh
+├── src/
+│   └── roles/
+│       └── deployer.yaml         # ClusterRole applied as kwo-deployer
 └── examples/
     ├── app.yaml                  # Complete app example
     └── github-actions/

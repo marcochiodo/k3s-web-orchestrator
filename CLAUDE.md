@@ -58,12 +58,12 @@ The Kubernetes API is the interface. Tenants get a kubeconfig and use `kubectl` 
 │  ┌─────────────────────────┴─────────────────────────────────┐  │
 │  │  Tenant Namespaces                                        │  │
 │  │                                                           │  │
-│  │  Each tenant has:                                         │  │
-│  │  - Dedicated namespace                                    │  │
-│  │  - ServiceAccount with namespace-only permissions         │  │
-│  │  - Kubeconfig for external access (CI/CD)                 │  │
+│  │  Tenant = isolated namespace holding workloads.           │  │
+│  │  User   = ServiceAccount (kube-system) bound to a         │  │
+│  │           kwo-<role> ClusterRole, global or per-namespace,│  │
+│  │           with a kubeconfig for external access (CI/CD).  │  │
 │  │                                                           │  │
-│  │  Tenants deploy standard Kubernetes resources:            │  │
+│  │  Users deploy standard Kubernetes resources:              │  │
 │  │  Deployments, Services, Ingresses, CronJobs, Secrets      │  │
 │  └───────────────────────────────────────────────────────────┘  │
 │                                                                 │
@@ -74,42 +74,36 @@ The Kubernetes API is the interface. Tenants get a kubeconfig and use `kubectl` 
 
 ---
 
-## Tenant Isolation (RBAC)
+## Access Model: Tenants, Users, Roles
 
-Each tenant gets a Role scoped to their namespace:
+KWO separates **workloads** from **access**:
 
-```yaml
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: tenant-deployer
-  namespace: {{ namespace }}
-rules:
-  - apiGroups: ["", "apps", "batch", "networking.k8s.io"]
-    resources: 
-      - deployments
-      - services
-      - secrets
-      - configmaps
-      - cronjobs
-      - jobs
-      - ingresses
-      - pods
-      - pods/log
-    verbs: ["*"]
-```
+- **Tenant** = an isolated namespace. Created by `kwo-create-tenant <name>`, which also provisions a namespace-scoped `deployer` ServiceAccount + Role + kubeconfig (single-namespace CI use).
+- **User** = an access principal. A ServiceAccount in `kube-system`, created interactively by `kwo-create-user`, bound to a **role** with a **scope**, and handed a kubeconfig.
+- **Role** = a `ClusterRole` named `kwo-<role>`, defined in `src/roles/*.yaml` and applied during install. Add a role by dropping a new `ClusterRole` YAML in `src/roles/` and re-running `install.sh`.
 
-**What tenants CAN do:**
-- Deploy applications
-- Create Ingresses (Traefik handles TLS automatically)
-- Manage secrets and configmaps
-- Create CronJobs
-- View logs
+### Scope
 
-**What tenants CANNOT do:**
-- Access other namespaces
-- Modify cluster-level resources
-- See other tenants' workloads
+`kwo-create-user` prompts for username, role, and namespaces:
+
+- **Global** (namespaces left empty) → `ClusterRoleBinding` to `kwo-<role>`. The user reaches all namespaces and (with `deployer`) can create/delete namespaces.
+- **Namespace-scoped** (comma-separated list) → one `RoleBinding` to `kwo-<role>` per namespace. The user is confined to those namespaces.
+
+The `ClusterRole` is shared and never deleted on `kwo-delete-user`; only the bindings + ServiceAccount are removed (archived first).
+
+### The `deployer` role (`src/roles/deployer.yaml` → `kwo-deployer`)
+
+**CAN:**
+- Manage pods, deployments, statefulsets, daemonsets, replicasets, services, endpoints
+- Manage secrets, configmaps, PVCs, cronjobs/jobs, HPAs
+- Create Ingresses + Traefik CRDs (middlewares, ingressroutes, traefikservices, tlsoptions) — Traefik handles TLS automatically
+- Create/delete namespaces (effective only at global scope)
+
+**CANNOT:**
+- Touch cluster-level RBAC, nodes, or other cluster resources
+- Reach namespaces outside its grant (namespace-scoped users)
+
+> Legacy: `kwo-create-tenant`/`kwo-update-tenant` predate the role-based user model (they bake a `tenant-deployer` Role + `deployer` SA into one namespace). They still work, but for granting access to people or pipelines prefer `kwo-create-user`.
 
 ---
 
@@ -122,7 +116,7 @@ Developer                         GitHub Actions                    k3s Cluster
     │ ─────────────────────────────────>│                               │
     │                                   │                               │
     │                                   │  kubectl apply -f k8s/        │
-    │                                   │  (using tenant kubeconfig)    │
+    │                                   │  (using tenant/user kubeconfig)│
     │                                   │ ─────────────────────────────>│
     │                                   │                               │
     │                                   │        Applied                │
@@ -143,12 +137,17 @@ kwo/
 ├── README.md                     # User documentation
 ├── LICENSE
 ├── bin/                          # Scripts installed to /usr/share/kwo/bin/
-│   ├── create-tenant.sh          # Tenant management
+│   ├── create-tenant.sh          # Tenant (namespace) management
 │   ├── delete-tenant.sh
 │   ├── list-tenants.sh
 │   ├── update-tenant.sh
+│   ├── create-user.sh            # User (access principal) management
+│   ├── delete-user.sh
+│   ├── list-users.sh
 │   ├── dns.sh                    # DNS provider management
-│   ├── registry.sh               # Registry management
+│   ├── registry.sh               # Private registry management
+│   ├── update-k3s.sh             # k3s maintenance
+│   ├── cleanup-k3s.sh
 │   ├── status.sh                 # Diagnostics
 │   ├── check-tls.sh
 │   ├── logs.sh
@@ -156,11 +155,12 @@ kwo/
 │       ├── common.sh             # Shared library
 │       ├── dns-helpers.sh        # DNS management helpers
 │       └── registry-helpers.sh   # Registry management helpers
+├── src/
+│   └── roles/                    # ClusterRoles applied as kwo-<role>
+│       └── deployer.yaml
 └── examples/
-    ├── deployment.yaml           # Example: basic deployment
-    ├── ingress-tls.yaml          # Example: ingress with auto-TLS
-    ├── cronjob.yaml              # Example: scheduled job
-    ├── registry-usage.yaml       # Example: using private registry
+    ├── app.yaml                  # Example: deployment + service + ingress + cronjob
+    ├── registry-usage.yaml       # Example: using the private registry
     └── github-actions/
         └── deploy.yml            # Example: CI/CD workflow
 ```
@@ -173,8 +173,13 @@ kwo/
 │   ├── delete-tenant.sh
 │   ├── list-tenants.sh
 │   ├── update-tenant.sh
+│   ├── create-user.sh
+│   ├── delete-user.sh
+│   ├── list-users.sh
 │   ├── dns.sh
 │   ├── registry.sh
+│   ├── update-k3s.sh
+│   ├── cleanup-k3s.sh
 │   ├── status.sh
 │   ├── check-tls.sh
 │   ├── logs.sh
@@ -182,19 +187,23 @@ kwo/
 │       ├── common.sh
 │       ├── dns-helpers.sh
 │       └── registry-helpers.sh
+├── roles/                        # ClusterRole YAMLs (copied from src/roles/)
+│   └── deployer.yaml
 └── VERSION                       # KWO version
 
 /var/lib/kwo/                     # Persistent state
-├── kubeconfigs/                  # Tenant kubeconfig files (700)
+├── kubeconfigs/                  # Tenant + user kubeconfig files (700)
 ├── metadata/                     # Tenant metadata JSON (755)
-├── archive/                      # Deleted tenant archives (700)
-│   ├── tenant-*/                 # Archived tenant data
+│   └── users/                    # User metadata JSON
+├── archive/                      # Deleted resource archives (700)
+│   ├── <tenant>-*/               # Archived tenant data
+│   ├── user-*/                   # Archived user bindings/kubeconfig
 │   ├── dns-*/                    # Archived DNS provider credentials
 │   └── registry-*/               # Archived registry credentials
 └── install.log                   # Installation history (640)
 
 /var/log/kwo/                     # Operation logs
-├── tenant-operations.log         # Create/delete/update (640)
+├── tenant-operations.log         # Tenant + user create/delete/update (640)
 └── diagnostics.log               # Diagnostic command output (640)
 
 /usr/local/bin/                   # Command symlinks
@@ -202,8 +211,13 @@ kwo/
 ├── kwo-delete-tenant -> /usr/share/kwo/bin/delete-tenant.sh
 ├── kwo-list-tenants -> /usr/share/kwo/bin/list-tenants.sh
 ├── kwo-update-tenant -> /usr/share/kwo/bin/update-tenant.sh
+├── kwo-create-user -> /usr/share/kwo/bin/create-user.sh
+├── kwo-delete-user -> /usr/share/kwo/bin/delete-user.sh
+├── kwo-list-users -> /usr/share/kwo/bin/list-users.sh
 ├── kwo-dns -> /usr/share/kwo/bin/dns.sh
 ├── kwo-registry -> /usr/share/kwo/bin/registry.sh
+├── kwo-update-k3s -> /usr/share/kwo/bin/update-k3s.sh
+├── kwo-cleanup-k3s -> /usr/share/kwo/bin/cleanup-k3s.sh
 ├── kwo-status -> /usr/share/kwo/bin/status.sh
 ├── kwo-check-tls -> /usr/share/kwo/bin/check-tls.sh
 └── kwo-logs -> /usr/share/kwo/bin/logs.sh
@@ -216,10 +230,12 @@ kwo/
 1. Detect OS and install prerequisites (including htpasswd for registry)
 2. Install k3s
 3. Configure DNS providers for Let's Encrypt (optional)
-4. Configure private Docker registry (optional)
-5. Configure Traefik with ACME (DNS-01 challenge)
+4. Configure private Docker registry (optional; HTTP-01 by default, no DNS needed)
+5. Configure Traefik with ACME (always an HTTP-01 resolver + any DNS-01 resolvers)
 6. Store DNS and registry credentials as Kubernetes Secrets
-7. Output instructions for creating first tenant
+7. Apply ClusterRoles from `src/roles/` (e.g. `kwo-deployer`)
+8. Install scripts + command symlinks
+9. Output instructions for creating the first tenant/user
 
 **Configuration during install:**
 - Let's Encrypt email
@@ -273,7 +289,7 @@ kwo-dns check [resolver-name]
 - **After installation:** Re-run `./install.sh` to configure or update
 
 **Features:**
-- Automatic TLS via Traefik (Let's Encrypt DNS-01)
+- Automatic TLS via Traefik — HTTP-01 (`letsencrypt`) by default, or DNS-01 if DNS providers are configured
 - htpasswd authentication with bcrypt
 - Global k3s integration (`/etc/rancher/k3s/registries.yaml`)
 - All tenants can pull images automatically (no imagePullSecrets needed)
@@ -351,10 +367,10 @@ sudo kwo-registry rotate-credentials
 **Installation Flow:**
 
 During `./install.sh`:
-1. DNS providers configured first (required for TLS)
+1. DNS providers configured (optional — registry works without them via HTTP-01)
 2. Registry prompt appears (optional, can skip)
 3. Select domain (e.g., `registry.example.com`)
-4. Select DNS provider for certificate resolver
+4. Select certificate resolver (default: HTTP-01 `letsencrypt`; DNS-01 resolvers offered if configured)
 5. Choose username (default: `docker`)
 6. Auto-generate random password
 7. Deploy registry (PVC, Deployment, Service, Ingress)
@@ -370,6 +386,13 @@ Re-running `./install.sh`:
 
 **Non-Interactive Mode:**
 ```bash
+# Default: HTTP-01 resolver 'letsencrypt' (no DNS provider needed)
+sudo NON_INTERACTIVE=true \
+     REGISTRY_DOMAIN="registry.example.com" \
+     REGISTRY_USERNAME="docker" \
+     ./install.sh
+
+# Use a DNS-01 resolver instead (requires a configured DNS provider):
 sudo NON_INTERACTIVE=true \
      REGISTRY_DOMAIN="registry.example.com" \
      REGISTRY_USERNAME="docker" \
@@ -379,6 +402,56 @@ sudo NON_INTERACTIVE=true \
 # Skip registry entirely:
 sudo REGISTRY_SKIP="true" ./install.sh
 ```
+
+`REGISTRY_CERT_RESOLVER` defaults to `letsencrypt` (HTTP-01) when unset.
+
+---
+
+## Tenant Manifest Guidelines
+
+Regole da rispettare in tutti i manifest k8s deployati su questo cluster.
+
+### ⚠️ CRITICO — Probe (liveness / readiness)
+
+> **`initialDelaySeconds` minimo assoluto: 300s (5 minuti). MAI valori inferiori.**
+
+**Perché è critico:** probe aggressive con `initialDelaySeconds` bassi (3-15s) causano un loop distruttivo:
+1. Il kubelet killa il container prima che l'app finisca lo startup
+2. Il container riparte → stesso crash → loop infinito
+3. Ogni restart spika CPU (Node.js/Python che si riavviano da zero)
+4. k3s e containerd impazziscono a gestire i crash → consumano CPU loro stessi
+5. Il load average esplode: su una macchina a 4 CPU si è raggiunto **load 21**
+
+**Incidente reale su questo cluster (maggio 2026):** deployment con probe a 3-5s hanno causato centinaia di restart su più namespace contemporaneamente (webio: 236 restart, shynet: 1237 restart, strapi: 310 restart) mandando il server in crash con load average 12-21 su 4 CPU. Il server è rimasto degradato per mesi prima che il problema venisse identificato.
+
+```yaml
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  initialDelaySeconds: 300   # MINIMO ASSOLUTO — mai meno di 300s
+  periodSeconds: 30
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  initialDelaySeconds: 300   # MINIMO ASSOLUTO — mai meno di 300s
+  periodSeconds: 30
+  failureThreshold: 3
+```
+
+Per app con startup molto lento (es. Strapi production build): usare `initialDelaySeconds: 600`.
+
+### Altre convenzioni
+
+- **imagePullPolicy**: sempre `Always` (tag mutabili)
+- **Service**: sempre `ClusterIP`
+- **Strategy**: `Recreate` per app con DB embedded (SQLite, DuckDB) — single-writer obbligatorio
+- **StorageClass**: `local-path` (k3s default), `accessModes: ReadWriteOnce`
+- **Probe httpGet su Django/framework web**: aggiungere `httpHeaders: [{name: Host, value: "<domain>"}]` per evitare che le probe arrivino con l'IP del pod (rifiutato da ALLOWED_HOSTS)
+- **drop_caches**: non aggiungere mai script che eseguono `echo 1 > /proc/sys/vm/drop_caches` — svuotare la page cache manualmente peggiora le prestazioni, il kernel gestisce la memoria da solo
 
 ---
 

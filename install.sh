@@ -1041,56 +1041,62 @@ create_command_symlinks() {
 select_dns_provider_for_registry() {
     local existing_resolver="${1:-}"
 
-    # Count providers from DNS_PROVIDER_LIST
-    local dns_count=${#DNS_PROVIDER_LIST[@]}
+    # Build the list of available certificate resolvers.
+    # The HTTP-01 'letsencrypt' resolver is always active (no DNS credentials
+    # needed) and is offered first as the default. DNS-01 resolvers follow.
+    local resolvers=("letsencrypt")
+    local provider
+    for provider in "${DNS_PROVIDER_LIST[@]}"; do
+        resolvers+=("letsencrypt-${provider}")
+    done
 
-    if [ "$dns_count" -eq 0 ]; then
-        log_error "No DNS providers configured"
-        return 1
-    elif [ "$dns_count" -eq 1 ]; then
-        # Auto-select single provider
-        local resolver="letsencrypt-${DNS_PROVIDER_LIST[0]}"
-        log_info "Auto-selected DNS provider: $resolver" >&2
-        echo "$resolver"
-        return 0
-    else
-        # Multiple providers - interactive selection
-        echo ""
-        echo "Multiple DNS providers available:"
-        echo ""
-
-        local i=1
-        declare -A resolver_map
-
-        for provider in "${DNS_PROVIDER_LIST[@]}"; do
-            local resolver="letsencrypt-${provider}"
-            echo "$i) $resolver"
-            resolver_map[$i]="$resolver"
-            i=$((i + 1))
-        done
-
-        echo ""
-
-        if [ -n "$existing_resolver" ]; then
-            echo "Current selection: $existing_resolver"
-            read -p "Keep current selection? [Y/n]: " keep_current
-
-            if [ "$keep_current" != "n" ] && [ "$keep_current" != "N" ]; then
-                echo "$existing_resolver"
-                return 0
-            fi
-        fi
-
-        read -p "Select DNS provider [1-$((i-1))]: " choice
-
-        while [ -z "${resolver_map[$choice]:-}" ]; do
-            log_error "Invalid choice"
-            read -p "Select DNS provider [1-$((i-1))]: " choice
-        done
-
-        echo "${resolver_map[$choice]}"
+    # Only the HTTP-01 resolver available - auto-select it.
+    if [ "${#resolvers[@]}" -eq 1 ]; then
+        log_info "Using HTTP-01 resolver 'letsencrypt' for registry TLS" >&2
+        echo "letsencrypt"
         return 0
     fi
+
+    # Multiple resolvers - interactive selection. All menu/prompt output goes
+    # to stderr so only the chosen resolver name lands on stdout (captured by
+    # the caller via command substitution).
+    echo "" >&2
+    echo "Available certificate resolvers:" >&2
+    echo "" >&2
+
+    local i=1
+    local resolver
+    declare -A resolver_map
+    for resolver in "${resolvers[@]}"; do
+        if [ "$resolver" = "letsencrypt" ]; then
+            echo "$i) letsencrypt (HTTP-01, no DNS credentials needed) [default]" >&2
+        else
+            echo "$i) $resolver (DNS-01)" >&2
+        fi
+        resolver_map[$i]="$resolver"
+        i=$((i + 1))
+    done
+    echo "" >&2
+
+    if [ -n "$existing_resolver" ]; then
+        echo "Current selection: $existing_resolver" >&2
+        read -p "Keep current selection? [Y/n]: " keep_current
+        if [ "$keep_current" != "n" ] && [ "$keep_current" != "N" ]; then
+            echo "$existing_resolver"
+            return 0
+        fi
+    fi
+
+    read -p "Select resolver [1-$((i-1)), default 1]: " choice
+    choice="${choice:-1}"
+    while [ -z "${resolver_map[$choice]:-}" ]; do
+        log_error "Invalid choice"
+        read -p "Select resolver [1-$((i-1)), default 1]: " choice
+        choice="${choice:-1}"
+    done
+
+    echo "${resolver_map[$choice]}"
+    return 0
 }
 
 # Deploy registry Kubernetes resources
@@ -1424,19 +1430,9 @@ print_registry_credentials() {
 # Called after: configure_dns_providers
 # Called before: generate_traefik_config
 configure_registry() {
-    # Check DNS provider count
-    local dns_count=${#DNS_PROVIDER_LIST[@]}
-
-    if [ "$dns_count" -eq 0 ]; then
-        if [ "${NON_INTERACTIVE:-false}" = "true" ] && [ "${REGISTRY_SKIP:-false}" != "true" ]; then
-            log_error "Cannot configure registry: No DNS providers configured"
-            log_error "Registry requires DNS provider for automatic TLS certificates"
-            exit 1
-        fi
-        log_warn "No DNS providers configured - skipping registry setup"
-        log_warn "Configure DNS providers first with: sudo kwo-dns add <provider>"
-        return 0
-    fi
+    # Registry TLS uses the always-on HTTP-01 'letsencrypt' resolver by default,
+    # so it can be configured even without any DNS providers. A DNS-01 resolver
+    # can be selected instead when DNS providers are configured.
 
     # Check for existing configuration
     local existing_domain=""
@@ -1472,7 +1468,7 @@ configure_registry() {
         else
             echo "KWO can deploy a private Docker registry for your tenants."
             echo "Features:"
-            echo "  - Automatic TLS via Traefik"
+            echo "  - Automatic TLS via Traefik (HTTP-01 by default, no DNS needed)"
             echo "  - htpasswd authentication"
             echo "  - Global k3s integration (all tenants can pull)"
             echo "  - 50Gi persistent storage"
@@ -1557,11 +1553,27 @@ configure_registry() {
         REGISTRY_DOMAIN="${REGISTRY_DOMAIN:?REGISTRY_DOMAIN required in non-interactive mode}"
         REGISTRY_USERNAME="${REGISTRY_USERNAME:-docker}"
 
-        # Auto-select DNS provider
-        if [ "$dns_count" -eq 1 ]; then
-            REGISTRY_CERT_RESOLVER="letsencrypt-${DNS_PROVIDER_LIST[0]}"
-        else
-            REGISTRY_CERT_RESOLVER="${REGISTRY_CERT_RESOLVER:?REGISTRY_CERT_RESOLVER required when multiple DNS providers exist}"
+        # Select certificate resolver. Defaults to the always-on HTTP-01
+        # 'letsencrypt' resolver; override with REGISTRY_CERT_RESOLVER to use a
+        # DNS-01 resolver (e.g. letsencrypt-cloudflare).
+        REGISTRY_CERT_RESOLVER="${REGISTRY_CERT_RESOLVER:-letsencrypt}"
+
+        # Validate the resolver exists: either the HTTP-01 'letsencrypt' or a
+        # configured DNS-01 resolver (letsencrypt-<provider>).
+        if [ "$REGISTRY_CERT_RESOLVER" != "letsencrypt" ]; then
+            local resolver_ok=false
+            local provider
+            for provider in "${DNS_PROVIDER_LIST[@]}"; do
+                if [ "$REGISTRY_CERT_RESOLVER" = "letsencrypt-${provider}" ]; then
+                    resolver_ok=true
+                    break
+                fi
+            done
+            if [ "$resolver_ok" != true ]; then
+                log_error "Unknown REGISTRY_CERT_RESOLVER: $REGISTRY_CERT_RESOLVER"
+                log_error "Use 'letsencrypt' (HTTP-01) or a configured DNS-01 resolver"
+                exit 1
+            fi
         fi
 
         # Validate domain
