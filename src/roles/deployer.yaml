@@ -11,6 +11,7 @@ rules:
     resources:
       - pods
       - pods/log
+      - pods/exec
       - pods/portforward
       - services
       - endpoints
