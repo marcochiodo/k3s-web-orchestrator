@@ -653,6 +653,11 @@ generate_traefik_config() {
     additional_args+="      - \"--certificatesresolvers.letsencrypt.acme.httpchallenge=true\""$'\n'
     additional_args+="      - \"--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web\""$'\n'
 
+    # Disable the request read timeout on websecure so large uploads (e.g. multi-GB
+    # container image layers pushed to the private registry) are not cut off at the
+    # Traefik default (~60s). 0 = no limit.
+    additional_args+="      - \"--entrypoints.websecure.transport.respondingTimeouts.readTimeout=0\""$'\n'
+
     local env_vars=""
 
     # Add DNS-01 resolvers for each configured provider
@@ -1166,10 +1171,6 @@ spec:
               value: "/auth/htpasswd"
             - name: REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY
               value: "/var/lib/registry"
-            - name: REGISTRY_HTTP_TIMEOUT_READ
-              value: "1800s"
-            - name: REGISTRY_HTTP_TIMEOUT_WRITE
-              value: "1800s"
             - name: REGISTRY_STORAGE_DELETE_ENABLED
               value: "true"
           volumeMounts:
