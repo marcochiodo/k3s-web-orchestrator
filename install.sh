@@ -112,6 +112,32 @@ install_prerequisites() {
     fi
 }
 
+# Make the node identity survive a reboot. Two independent protections:
+#   1. the cloud guest agent must stop rewriting /etc/hostname from instance
+#      metadata (GCE and Azure do it at every boot);
+#   2. k3s must not derive the node name from the hostname at all.
+# Without (2) a hostname change registers a *new* node: the original goes
+# NotReady and every local-path PV becomes unschedulable, because its
+# nodeAffinity still points at the old name. Both steps are idempotent and run
+# on existing installations too, where k3s reads config.yaml at the next start.
+pin_node_identity() {
+    if [ -d /etc/cloud/cloud.cfg.d ]; then
+        echo "preserve_hostname: true" > /etc/cloud/cloud.cfg.d/99-preserve-hostname.cfg
+    fi
+    if [ -f /etc/default/instance_configs.cfg ] || command -v google_metadata_script_runner &> /dev/null; then
+        printf '[Instance]\nset_hostname = false\n' > /etc/default/instance_configs.cfg.template
+    fi
+
+    mkdir -p /etc/rancher/k3s
+    if grep -q '^node-name:' /etc/rancher/k3s/config.yaml 2>/dev/null; then
+        local pinned=$(sed -n 's/^node-name:[[:space:]]*//p' /etc/rancher/k3s/config.yaml)
+        [ "$pinned" = "$API_DOMAIN" ] || log_warn "config.yaml pins node-name to '$pinned', not '$API_DOMAIN' - leaving it alone"
+    else
+        echo "node-name: $API_DOMAIN" >> /etc/rancher/k3s/config.yaml
+        log_info "Pinned k3s node name to: $API_DOMAIN"
+    fi
+}
+
 # Configure system hostname
 configure_hostname() {
     if [ -z "${API_DOMAIN:-}" ]; then
@@ -141,21 +167,19 @@ configure_hostname() {
         fi
 
         log_info "k3s already installed with compatible hostname: $k3s_node_name"
+        # The running hostname may have drifted from the node name (a reboot on
+        # GCE is enough): realign it and pin the identity before it bites.
+        [ "$current_hostname" = "$API_DOMAIN" ] || {
+            log_warn "Hostname is '$current_hostname' but the node is '$k3s_node_name' - realigning"
+            hostnamectl set-hostname "$API_DOMAIN"
+        }
+        pin_node_identity
         return 0
     fi
 
     log_info "Configuring system hostname to: $API_DOMAIN"
     hostnamectl set-hostname "$API_DOMAIN"
-
-    # cloud-init and cloud guest agents rewrite /etc/hostname from instance
-    # metadata at every boot, silently undoing the line above. Opt out, so the
-    # hostname survives a reboot.
-    if [ -d /etc/cloud/cloud.cfg.d ]; then
-        echo "preserve_hostname: true" > /etc/cloud/cloud.cfg.d/99-preserve-hostname.cfg
-    fi
-    if [ -f /etc/default/instance_configs.cfg ] || command -v google_metadata_script_runner &> /dev/null; then
-        printf '[Instance]\nset_hostname = false\n' > /etc/default/instance_configs.cfg.template
-    fi
+    pin_node_identity
 
     # Verify hostname was set
     local current_hostname=$(hostname)
