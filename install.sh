@@ -147,6 +147,16 @@ configure_hostname() {
     log_info "Configuring system hostname to: $API_DOMAIN"
     hostnamectl set-hostname "$API_DOMAIN"
 
+    # cloud-init and cloud guest agents rewrite /etc/hostname from instance
+    # metadata at every boot, silently undoing the line above. Opt out, so the
+    # hostname survives a reboot.
+    if [ -d /etc/cloud/cloud.cfg.d ]; then
+        echo "preserve_hostname: true" > /etc/cloud/cloud.cfg.d/99-preserve-hostname.cfg
+    fi
+    if [ -f /etc/default/instance_configs.cfg ] || command -v google_metadata_script_runner &> /dev/null; then
+        printf '[Instance]\nset_hostname = false\n' > /etc/default/instance_configs.cfg.template
+    fi
+
     # Verify hostname was set
     local current_hostname=$(hostname)
     if [ "$current_hostname" = "$API_DOMAIN" ]; then
@@ -229,6 +239,14 @@ install_k3s() {
     if [ -n "${API_DOMAIN:-}" ]; then
         log_info "Adding TLS SAN for: $API_DOMAIN"
         k3s_args="$k3s_args --tls-san $API_DOMAIN"
+        # Pin the node name instead of letting k3s derive it from the running
+        # hostname. Cloud guest agents (GCE, Azure) reset the hostname from
+        # instance metadata on reboot: k3s then registers a brand new node,
+        # the original one goes NotReady, and every local-path PV becomes
+        # unschedulable because its nodeAffinity still points at the old name.
+        # Symptom: pods stuck Pending with "didn't match PersistentVolume's
+        # node affinity" and an unreachable duplicate node.
+        k3s_args="$k3s_args --node-name $API_DOMAIN"
     fi
 
     if [ -n "${K3S_VERSION:-}" ]; then
