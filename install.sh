@@ -1492,8 +1492,8 @@ configure_registry() {
             echo "  - Global k3s integration (all tenants can pull)"
             echo "  - 50Gi persistent storage"
             echo ""
-            read -p "Configure private registry now? [Y/n]: " configure_registry_now
-            if [ "$configure_registry_now" = "n" ] || [ "$configure_registry_now" = "N" ]; then
+            read -p "Configure private registry now? [y/N]: " configure_registry_now
+            if [ "$configure_registry_now" != "y" ] && [ "$configure_registry_now" != "Y" ]; then
                 log_info "Skipping registry configuration"
                 return 0
             fi
