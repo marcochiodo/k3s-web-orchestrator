@@ -1416,7 +1416,7 @@ save_registry_config() {
     # On a fresh install the ConfigMap does not exist yet (save_cluster_config
     # runs later in main), so create an empty one before patching it.
     if ! kubectl get configmap kwo-config -n kube-system &>/dev/null; then
-        kubectl create configmap kwo-config -n kube-system >/dev/null
+        kubectl create configmap kwo-config -n kube-system --save-config >/dev/null
     fi
 
     # Update ConfigMap with registry fields
