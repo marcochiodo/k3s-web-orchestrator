@@ -1413,6 +1413,12 @@ save_registry_config() {
 
     local created_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
+    # On a fresh install the ConfigMap does not exist yet (save_cluster_config
+    # runs later in main), so create an empty one before patching it.
+    if ! kubectl get configmap kwo-config -n kube-system &>/dev/null; then
+        kubectl create configmap kwo-config -n kube-system >/dev/null
+    fi
+
     # Update ConfigMap with registry fields
     kubectl patch configmap kwo-config -n kube-system --type=merge -p "{\"data\":{\"registry-enabled\":\"true\",\"registry-domain\":\"$REGISTRY_DOMAIN\",\"registry-username\":\"$REGISTRY_USERNAME\",\"registry-certresolver\":\"$REGISTRY_CERT_RESOLVER\",\"registry-created-at\":\"$created_at\"}}" >/dev/null
 
