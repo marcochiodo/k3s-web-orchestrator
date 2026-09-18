@@ -146,6 +146,7 @@ kwo/
 │   ├── list-users.sh
 │   ├── dns.sh                    # DNS provider management
 │   ├── registry.sh               # Private registry management
+│   ├── rename-host.sh            # Hostname / API / registry domain changes
 │   ├── update-k3s.sh             # k3s maintenance
 │   ├── cleanup-k3s.sh
 │   ├── status.sh                 # Diagnostics
@@ -178,6 +179,7 @@ kwo/
 │   ├── list-users.sh
 │   ├── dns.sh
 │   ├── registry.sh
+│   ├── rename-host.sh
 │   ├── update-k3s.sh
 │   ├── cleanup-k3s.sh
 │   ├── status.sh
@@ -216,6 +218,7 @@ kwo/
 ├── kwo-list-users -> /usr/share/kwo/bin/list-users.sh
 ├── kwo-dns -> /usr/share/kwo/bin/dns.sh
 ├── kwo-registry -> /usr/share/kwo/bin/registry.sh
+├── kwo-rename-host -> /usr/share/kwo/bin/rename-host.sh
 ├── kwo-update-k3s -> /usr/share/kwo/bin/update-k3s.sh
 ├── kwo-cleanup-k3s -> /usr/share/kwo/bin/cleanup-k3s.sh
 ├── kwo-status -> /usr/share/kwo/bin/status.sh
@@ -243,6 +246,18 @@ kwo/
 - DNS provider credentials
 - Registry domain and username - optional
 - API endpoint domain (optional, can use IP)
+
+---
+
+## Host Identity
+
+Three names, equal at install time, may diverge later:
+
+- **k8s node name** — immutable (local-path PVs are bound to it). Pinned as `node-name` in `/etc/rancher/k3s/config.yaml` together with `tls-san`, which survives `kwo-update-k3s` (the systemd unit args do not).
+- **machine hostname** — free to change once the node name is pinned.
+- **API hostnames** — `tls-san` list; the first is `api-domain` in `kwo-config` and the default for new kubeconfigs. Full list in `api-domains`.
+
+`kwo-rename-host` changes hostname, API hostnames and registry hostnames (`registry-domains`, one Ingress `registry-<slug>` per domain) in three optional steps; each list is complete, so a migration is two runs (old+new, then new only). `install.sh` never touches hostname or API domain on an existing installation: it warns when the three values differ and points to `kwo-rename-host`.
 
 ---
 
@@ -315,7 +330,7 @@ PVC: registry-storage (50Gi)
   - htpasswd file (bcrypt hash)
   - plaintext username and password (for k3s registries.yaml)
 - Configuration: ConfigMap `kwo-config` (kube-system)
-  - registry-enabled, registry-domain, registry-username, registry-certresolver
+  - registry-enabled, registry-domain, registry-domains, registry-username, registry-certresolver
 - k3s config: `/etc/rancher/k3s/registries.yaml` (chmod 600)
 - Archive: `/var/lib/kwo/archive/registry-*` on credential rotation
 

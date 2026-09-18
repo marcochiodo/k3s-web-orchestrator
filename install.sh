@@ -13,54 +13,10 @@ DNS_CONFIGURED=false
 DNS_PROVIDER_LIST=()
 declare -A DNS_CREDS
 
-# Color output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
-
-log_info() {
-    echo -e "${GREEN}[INFO]${NC} $1"
-}
-
-log_warn() {
-    echo -e "${YELLOW}[WARN]${NC} $1"
-}
-
-log_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
-}
-
-check_disk_space() {
-    local path="$1" required_mb="$2" context="${3:-operation}"
-    local available_mb
-    available_mb=$(df -m "$path" 2>/dev/null | awk 'NR==2 {print $4}')
-    if [ -z "$available_mb" ]; then log_warn "Could not check disk space on $path"; return 0; fi
-    if [ "$available_mb" -lt "$required_mb" ]; then
-        log_error "Insufficient disk space for $context"
-        log_error "  Available: ${available_mb}MB on $path — Required: ${required_mb}MB"
-        exit 1
-    fi
-    log_info "Disk space OK: ${available_mb}MB available on $path (need ${required_mb}MB)"
-}
-
-# Validate domain format (FQDN)
-validate_domain() {
-    local domain="$1"
-    [[ "$domain" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*$ ]]
-}
-
-# Generate 32-char random password (base64-safe, alphanumeric only)
-generate_password() {
-    openssl rand -base64 32 | tr -d '/+=' | head -c 32
-}
-
-# Create htpasswd bcrypt hash
-# Args: $1=username $2=password
-# Returns: username:$2y$...
-hash_password_bcrypt() {
-    htpasswd -Bbn "$1" "$2"
-}
+# Shared helpers (logging, validation, k3s config.yaml, registry resources)
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$REPO_ROOT/bin/lib/common.sh"
+source "$REPO_ROOT/bin/lib/registry-helpers.sh"
 
 # Detect OS
 detect_os() {
@@ -112,74 +68,41 @@ install_prerequisites() {
     fi
 }
 
-# Make the node identity survive a reboot. Two independent protections:
-#   1. the cloud guest agent must stop rewriting /etc/hostname from instance
-#      metadata (GCE and Azure do it at every boot);
-#   2. k3s must not derive the node name from the hostname at all.
-# Without (2) a hostname change registers a *new* node: the original goes
-# NotReady and every local-path PV becomes unschedulable, because its
-# nodeAffinity still points at the old name. Both steps are idempotent and run
-# on existing installations too, where k3s reads config.yaml at the next start.
-pin_node_identity() {
-    if [ -d /etc/cloud/cloud.cfg.d ]; then
-        echo "preserve_hostname: true" > /etc/cloud/cloud.cfg.d/99-preserve-hostname.cfg
-    fi
-    if [ -f /etc/default/instance_configs.cfg ] || command -v google_metadata_script_runner &> /dev/null; then
-        printf '[Instance]\nset_hostname = false\n' > /etc/default/instance_configs.cfg.template
-    fi
-
-    mkdir -p /etc/rancher/k3s
-    if grep -q '^node-name:' /etc/rancher/k3s/config.yaml 2>/dev/null; then
-        local pinned=$(sed -n 's/^node-name:[[:space:]]*//p' /etc/rancher/k3s/config.yaml)
-        [ "$pinned" = "$API_DOMAIN" ] || log_warn "config.yaml pins node-name to '$pinned', not '$API_DOMAIN' - leaving it alone"
-    else
-        echo "node-name: $API_DOMAIN" >> /etc/rancher/k3s/config.yaml
-        log_info "Pinned k3s node name to: $API_DOMAIN"
-    fi
-}
-
-# Configure system hostname
+# Configure system hostname (fresh install only). On an existing installation
+# the node name is immutable, and hostname / API domain may legitimately differ
+# from it after a kwo-rename-host: report the three values and move on.
 configure_hostname() {
     if [ -z "${API_DOMAIN:-}" ]; then
         log_warn "No API domain configured, skipping hostname setup"
         return 0
     fi
 
-    # Check if k3s is already installed - prevent hostname changes
     if command -v k3s &> /dev/null; then
         local current_hostname=$(hostname)
         local k3s_node_name=$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+        [ -n "$k3s_node_name" ] || k3s_node_name="$current_hostname"
 
-        if [ -n "$k3s_node_name" ] && [ "$k3s_node_name" != "$API_DOMAIN" ]; then
-            log_error "CRITICAL: k3s is already installed with hostname: $k3s_node_name"
-            log_error "Cannot change hostname to: $API_DOMAIN"
-            log_error "Changing hostname on an existing k3s installation will cause:"
-            log_error "  - Multiple nodes in the cluster"
-            log_error "  - Persistent volume binding issues"
-            log_error "  - Service disruption"
-            echo ""
-            log_error "To reconfigure hostname, you must first uninstall k3s:"
-            echo "  sudo /usr/local/bin/k3s-uninstall.sh"
-            echo "  sudo rm -rf /var/lib/rancher/k3s"
-            echo "  Then run this installer again."
-            echo ""
-            exit 1
+        if [ "$k3s_node_name" != "$API_DOMAIN" ] || [ "$current_hostname" != "$API_DOMAIN" ]; then
+            log_warn "Host identity is not aligned (this is fine after a rename):"
+            log_warn "  - k8s node name:    $k3s_node_name (immutable)"
+            log_warn "  - machine hostname: $current_hostname"
+            log_warn "  - API domain:       $API_DOMAIN"
+            log_warn "Use 'kwo-rename-host' to change hostname or API/registry domains"
+        else
+            log_info "k3s already installed, node name: $k3s_node_name"
         fi
 
-        log_info "k3s already installed with compatible hostname: $k3s_node_name"
-        # The running hostname may have drifted from the node name (a reboot on
-        # GCE is enough): realign it and pin the identity before it bites.
-        [ "$current_hostname" = "$API_DOMAIN" ] || {
-            log_warn "Hostname is '$current_hostname' but the node is '$k3s_node_name' - realigning"
-            hostnamectl set-hostname "$API_DOMAIN"
-        }
-        pin_node_identity
+        # Pin the *actual* node name and the API SANs in config.yaml, which
+        # survives kwo-update-k3s (the systemd unit args do not)
+        pin_node_identity "$k3s_node_name"
+        [ -n "$(k3s_config_get tls-san)" ] || k3s_config_set tls-san $(split_csv "${API_DOMAINS:-$API_DOMAIN}")
         return 0
     fi
 
     log_info "Configuring system hostname to: $API_DOMAIN"
     hostnamectl set-hostname "$API_DOMAIN"
-    pin_node_identity
+    pin_node_identity "$API_DOMAIN"
+    k3s_config_set tls-san "$API_DOMAIN"
 
     # Verify hostname was set
     local current_hostname=$(hostname)
@@ -258,20 +181,9 @@ install_k3s() {
 
     log_info "Installing k3s..."
 
+    # node-name and tls-san are already in /etc/rancher/k3s/config.yaml
+    # (configure_hostname): k3s reads it at every start, including this one
     local k3s_args="--write-kubeconfig-mode 644"
-
-    if [ -n "${API_DOMAIN:-}" ]; then
-        log_info "Adding TLS SAN for: $API_DOMAIN"
-        k3s_args="$k3s_args --tls-san $API_DOMAIN"
-        # Pin the node name instead of letting k3s derive it from the running
-        # hostname. Cloud guest agents (GCE, Azure) reset the hostname from
-        # instance metadata on reboot: k3s then registers a brand new node,
-        # the original one goes NotReady, and every local-path PV becomes
-        # unschedulable because its nodeAffinity still points at the old name.
-        # Symptom: pods stuck Pending with "didn't match PersistentVolume's
-        # node affinity" and an unreachable duplicate node.
-        k3s_args="$k3s_args --node-name $API_DOMAIN"
-    fi
 
     if [ -n "${K3S_VERSION:-}" ]; then
         curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="${K3S_VERSION}" sh -s - $k3s_args
@@ -308,9 +220,12 @@ prompt_config() {
     local existing_email=""
     local existing_domain=""
 
+    API_DOMAINS=""
     if kubectl get configmap kwo-config -n kube-system &>/dev/null; then
         existing_email=$(kubectl get configmap kwo-config -n kube-system -o jsonpath='{.data.acme-email}' 2>/dev/null || echo "")
         existing_domain=$(kubectl get configmap kwo-config -n kube-system -o jsonpath='{.data.api-domain}' 2>/dev/null || echo "")
+        # Full SAN list managed by kwo-rename-host (first = api-domain)
+        API_DOMAINS=$(kubectl get configmap kwo-config -n kube-system -o jsonpath='{.data.api-domains}' 2>/dev/null || echo "")
     fi
 
     if [ "${NON_INTERACTIVE:-false}" = "true" ]; then
@@ -330,6 +245,7 @@ prompt_config() {
             log_info "Using existing API domain: $API_DOMAIN"
         else
             API_DOMAIN="${API_DOMAIN:-}"
+            [ "$API_DOMAIN" = "$existing_domain" ] || API_DOMAINS=""
         fi
 
         return 0
@@ -369,8 +285,9 @@ prompt_config() {
     if [ -n "$existing_domain" ]; then
         # Check if k3s is installed - hostname cannot be changed
         if command -v k3s &> /dev/null; then
-            echo "Current API hostname: $existing_domain (locked - k3s installed)"
-            log_info "API hostname cannot be changed on existing k3s installation"
+            echo "Current API hostname: $existing_domain"
+            [ -n "$API_DOMAINS" ] && [ "$API_DOMAINS" != "$existing_domain" ] && echo "All API hostnames:    $API_DOMAINS"
+            log_info "To change it on an existing installation use: sudo kwo-rename-host"
             API_DOMAIN="$existing_domain"
         else
             # k3s not installed, allow hostname change
@@ -860,6 +777,7 @@ metadata:
 data:
   api-server: "$api_server"
   api-domain: "${API_DOMAIN:-}"
+  api-domains: "${API_DOMAINS:-${API_DOMAIN:-}}"
   acme-email: "$ACME_EMAIL"
   dns-providers: "$dns_providers_list"
   dns-management-version: "v2"
@@ -1070,6 +988,7 @@ create_command_symlinks() {
         ["check-tls.sh"]="kwo-check-tls"
         ["logs.sh"]="kwo-logs"
         ["registry.sh"]="kwo-registry"
+        ["rename-host.sh"]="kwo-rename-host"
     )
 
     for script in "${!COMMANDS[@]}"; do
@@ -1287,47 +1206,18 @@ spec:
     maxResponseBodyBytes: 10737418240
 EOF
 
-    # 6. Create Ingress
-    log_info "[6/6] Creating registry Ingress with TLS..."
+    # 6. Create one Ingress per domain
+    log_info "[6/6] Creating registry Ingress(es) with TLS..."
 
     # Debug: verify variables are set
-    if [ -z "$REGISTRY_DOMAIN" ] || [ -z "$REGISTRY_CERT_RESOLVER" ]; then
+    if [ -z "$REGISTRY_DOMAINS" ] || [ -z "$REGISTRY_CERT_RESOLVER" ]; then
         log_error "Missing required variables:"
-        log_error "  REGISTRY_DOMAIN='$REGISTRY_DOMAIN'"
+        log_error "  REGISTRY_DOMAINS='$REGISTRY_DOMAINS'"
         log_error "  REGISTRY_CERT_RESOLVER='$REGISTRY_CERT_RESOLVER'"
         exit 1
     fi
 
-    cat <<EOF | kubectl apply -f -
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: registry
-  namespace: kube-system
-  labels:
-    app: registry
-    managed-by: kwo
-  annotations:
-    traefik.ingress.kubernetes.io/router.entrypoints: websecure
-    traefik.ingress.kubernetes.io/router.tls: "true"
-    traefik.ingress.kubernetes.io/router.tls.certresolver: $REGISTRY_CERT_RESOLVER
-    traefik.ingress.kubernetes.io/router.middlewares: kube-system-registry-timeouts@kubernetescrd
-spec:
-  rules:
-    - host: $REGISTRY_DOMAIN
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: registry
-                port:
-                  number: 5000
-  tls:
-    - hosts:
-        - $REGISTRY_DOMAIN
-EOF
+    sync_registry_ingresses "$REGISTRY_CERT_RESOLVER" $(split_csv "$REGISTRY_DOMAINS")
 
     log_info "Registry resources deployed successfully"
 
@@ -1374,22 +1264,8 @@ configure_k3s_registry() {
         log_info "Archived existing registries.yaml"
     fi
 
-    # Write new registries.yaml
-    cat > "$registries_file" <<EOF
-# KWO Private Registry Configuration
-# Auto-generated by KWO install.sh
-# Last updated: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
-
-configs:
-  "$REGISTRY_DOMAIN":
-    auth:
-      username: $REGISTRY_USERNAME
-      password: $REGISTRY_PASSWORD
-    tls:
-      insecure_skip_verify: false
-EOF
-
-    chmod 600 "$registries_file"
+    # Write new registries.yaml (one entry per domain)
+    write_registries_yaml "$REGISTRY_USERNAME" "$REGISTRY_PASSWORD" $(split_csv "$REGISTRY_DOMAINS")
     log_info "Written /etc/rancher/k3s/registries.yaml"
 
     # Restart k3s to apply changes
@@ -1420,7 +1296,7 @@ save_registry_config() {
     fi
 
     # Update ConfigMap with registry fields
-    kubectl patch configmap kwo-config -n kube-system --type=merge -p "{\"data\":{\"registry-enabled\":\"true\",\"registry-domain\":\"$REGISTRY_DOMAIN\",\"registry-username\":\"$REGISTRY_USERNAME\",\"registry-certresolver\":\"$REGISTRY_CERT_RESOLVER\",\"registry-created-at\":\"$created_at\"}}" >/dev/null
+    kubectl patch configmap kwo-config -n kube-system --type=merge -p "{\"data\":{\"registry-enabled\":\"true\",\"registry-domain\":\"$REGISTRY_DOMAIN\",\"registry-domains\":\"$REGISTRY_DOMAINS\",\"registry-username\":\"$REGISTRY_USERNAME\",\"registry-certresolver\":\"$REGISTRY_CERT_RESOLVER\",\"registry-created-at\":\"$created_at\"}}" >/dev/null
 
     log_info "Registry configuration saved"
 }
@@ -1485,12 +1361,16 @@ configure_registry() {
 
     # Check for existing configuration
     local existing_domain=""
+    local existing_domains=""
     local existing_username=""
     local existing_resolver=""
 
     if kubectl get configmap kwo-config -n kube-system &>/dev/null; then
         existing_domain=$(kubectl get configmap kwo-config -n kube-system \
             -o jsonpath='{.data.registry-domain}' 2>/dev/null || echo "")
+        existing_domains=$(kubectl get configmap kwo-config -n kube-system \
+            -o jsonpath='{.data.registry-domains}' 2>/dev/null || echo "")
+        existing_domains="${existing_domains:-$existing_domain}"
         existing_username=$(kubectl get configmap kwo-config -n kube-system \
             -o jsonpath='{.data.registry-username}' 2>/dev/null || echo "")
         existing_resolver=$(kubectl get configmap kwo-config -n kube-system \
@@ -1505,7 +1385,7 @@ configure_registry() {
 
         if [ -n "$existing_domain" ]; then
             echo "Registry already configured:"
-            echo "  Domain:   $existing_domain"
+            echo "  Domain:   $existing_domains"
             echo "  Username: $existing_username"
             echo "  Resolver: $existing_resolver"
             echo ""
@@ -1529,30 +1409,21 @@ configure_registry() {
             fi
         fi
 
-        # Prompt for registry domain
+        # Prompt for registry domain(s): comma-separated, first is primary
         if [ -n "$existing_domain" ]; then
             echo ""
-            echo "Current registry domain: $existing_domain"
-            read -p "Update domain? [y/N]: " update_domain
+            echo "Current registry domain(s): $existing_domains"
+            read -p "Update domain(s)? [y/N]: " update_domain
 
             if [ "$update_domain" = "y" ] || [ "$update_domain" = "Y" ]; then
-                read -p "Registry domain (e.g., registry.example.com): " REGISTRY_DOMAIN
-                # Validate domain
-                while ! validate_domain "$REGISTRY_DOMAIN"; do
-                    log_error "Invalid domain format (must be valid FQDN)"
-                    read -p "Registry domain: " REGISTRY_DOMAIN
-                done
+                REGISTRY_DOMAINS=$(prompt_domain_list "Registry domain(s), comma-separated (e.g., registry.example.com)")
             else
-                REGISTRY_DOMAIN="$existing_domain"
+                REGISTRY_DOMAINS="$existing_domains"
             fi
         else
-            read -p "Registry domain (e.g., registry.example.com): " REGISTRY_DOMAIN
-            # Validate domain
-            while ! validate_domain "$REGISTRY_DOMAIN"; do
-                log_error "Invalid domain format (must be valid FQDN)"
-                read -p "Registry domain: " REGISTRY_DOMAIN
-            done
+            REGISTRY_DOMAINS=$(prompt_domain_list "Registry domain(s), comma-separated (e.g., registry.example.com)")
         fi
+        REGISTRY_DOMAIN="${REGISTRY_DOMAINS%%,*}"
 
         # Select DNS provider for cert resolver
         if [ -n "$existing_resolver" ]; then
@@ -1599,7 +1470,10 @@ configure_registry() {
             return 0
         fi
 
-        REGISTRY_DOMAIN="${REGISTRY_DOMAIN:?REGISTRY_DOMAIN required in non-interactive mode}"
+        # REGISTRY_DOMAIN may be a comma-separated list (first = primary)
+        REGISTRY_DOMAINS="${REGISTRY_DOMAIN:?REGISTRY_DOMAIN required in non-interactive mode}"
+        REGISTRY_DOMAINS=$(split_csv "$REGISTRY_DOMAINS" | paste -sd,)
+        REGISTRY_DOMAIN="${REGISTRY_DOMAINS%%,*}"
         REGISTRY_USERNAME="${REGISTRY_USERNAME:-docker}"
 
         # Select certificate resolver. Defaults to the always-on HTTP-01
@@ -1625,11 +1499,14 @@ configure_registry() {
             fi
         fi
 
-        # Validate domain
-        if ! validate_domain "$REGISTRY_DOMAIN"; then
-            log_error "Invalid REGISTRY_DOMAIN format: $REGISTRY_DOMAIN"
-            exit 1
-        fi
+        # Validate domains
+        local d
+        for d in $(split_csv "$REGISTRY_DOMAINS"); do
+            if ! validate_domain "$d"; then
+                log_error "Invalid REGISTRY_DOMAIN format: $d"
+                exit 1
+            fi
+        done
 
         REGENERATE_CREDS=true
     fi
@@ -1700,12 +1577,16 @@ print_next_steps() {
     echo "  - Node IP: $node_ip"
     if [ -n "${API_DOMAIN:-}" ]; then
         echo "  - API Server: https://${API_DOMAIN}:6443"
-        echo "  - Hostname: $API_DOMAIN"
+        [ -n "${API_DOMAINS:-}" ] && [ "$API_DOMAINS" != "$API_DOMAIN" ] && echo "  - API hostnames: $API_DOMAINS"
     else
         echo "  - API Server: https://${node_ip}:6443"
     fi
+    echo "  - Node name: $(kubectl get nodes -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)"
+    echo "  - Hostname: $(hostname)"
     echo "  - Kubeconfig: $KUBECONFIG"
     echo "  - ACME Email: $ACME_EMAIL"
+    echo ""
+    echo "  To change hostname, API or registry domains: sudo kwo-rename-host"
     echo ""
     echo "Certificate Resolvers:"
     if [ "$DNS_CONFIGURED" = false ]; then

@@ -104,6 +104,9 @@ Users get a role (currently `deployer`) and a scope:
 - `kwo-registry get-credentials` - Display the current username/password and `docker login` command
 - `kwo-registry rotate-credentials` - Generate a new password and update Secret, `registries.yaml`, and restart k3s
 
+**Host Management:**
+- `kwo-rename-host` - Interactive: change the machine hostname, the API server hostnames and/or the registry hostnames of an existing installation (see [Renaming Hosts](#renaming-hosts))
+
 **DNS Provider Management:**
 - `kwo-dns add <provider> [--suffix=<name>] [--non-interactive]` - Add DNS provider
 - `kwo-dns remove <resolver-name> [--force]` - Remove DNS provider
@@ -183,12 +186,14 @@ KWO can deploy its own private Docker registry inside the cluster, with automati
 During `install.sh`, after the (optional) DNS step, you are prompted to configure the registry:
 
 ```
-Registry domain (e.g., registry.example.com): registry.example.com
+Registry domain(s), comma-separated (e.g., registry.example.com): registry.example.com
 Select resolver [1-N, default 1]: 1        # 1) letsencrypt (HTTP-01)
 Registry username [docker]: docker
 ```
 
 The installer generates a random 32-character password and prints it once. Point `registry.example.com`'s A record at the server so HTTP-01 can issue the certificate.
+
+Several domains can be given, comma-separated: the first is the primary (shown by `kwo-registry`), each one gets its own Ingress (`registry-<domain-with-dashes>`) and certificate, and all of them are authenticated in `registries.yaml`. A domain whose certificate can no longer be issued does not affect the others. To change the list later use `kwo-rename-host`.
 
 Non-interactive install:
 
@@ -197,6 +202,11 @@ Non-interactive install:
 sudo NON_INTERACTIVE=true \
      REGISTRY_DOMAIN="registry.example.com" \
      REGISTRY_USERNAME="docker" \
+     ./install.sh
+
+# Several domains (first = primary):
+sudo NON_INTERACTIVE=true \
+     REGISTRY_DOMAIN="registry.example.com,registry.example.org" \
      ./install.sh
 
 # Use a DNS-01 resolver instead:
@@ -674,6 +684,49 @@ kubectl get svc
 - Verify service selector matches pod labels
 - Check pod is running: `kubectl get pods`
 
+## Renaming Hosts
+
+An installation has three names that start out equal and may diverge over time:
+
+- the **Kubernetes node name**: immutable. Every `local-path` volume is bound to it, so changing it would orphan all persistent data. It is pinned in `/etc/rancher/k3s/config.yaml` (`node-name`) so that neither a hostname change nor a cloud provider resetting the hostname on reboot can alter it.
+- the **machine hostname**: cosmetic, can be changed freely once the node name is pinned.
+- the **API server hostnames**: the names in the API certificate (`tls-san` in `config.yaml`) and the default `server:` for new kubeconfigs.
+
+Plus, when the registry is enabled, the **registry hostnames**.
+
+`kwo-rename-host` changes them interactively, one step at a time:
+
+```
+sudo kwo-rename-host
+
+--- Step 1/3: machine hostname ---
+Update the machine hostname (not the k8s node name)? [y/N]: y
+New hostname [host1.example.com]: host1.example.org
+
+--- Step 2/3: API server hostnames ---
+Update the API server hostnames? [y/N]: y
+API hostnames, comma-separated (first = default for new kubeconfigs) [host1.example.com]: host1.example.org,host1.example.com
+
+--- Step 3/3: registry hostnames ---
+Update the registry hostnames? [y/N]: y
+Registry hostnames, comma-separated (first = primary) [registry.example.com]: registry.example.org,registry.example.com
+```
+
+Each list is the **complete** list: names left out are removed. Old and new names coexist, so a domain migration takes two runs with no downtime:
+
+1. Run with old and new names together. The API certificate is regenerated with both, one Ingress per registry domain is created, `registries.yaml` authenticates all of them. Point the new names at the server in DNS.
+2. Update kubeconfigs (only the `server:` field needs to change, the token and CA are the same), CI secrets and image references in manifests at your own pace.
+3. Run again with the new names only.
+
+Kubeconfigs in `/var/lib/kwo/kubeconfigs/` can optionally be rewritten to the new primary API hostname; copies already handed out are unaffected either way and keep working as long as their hostname stays in the list.
+
+Notes:
+- k3s is restarted once at the end (running pods are not affected).
+- Originals of every modified file go to `/var/lib/kwo/archive/rename-host-<timestamp>/`.
+- Installations made before this command also pass `--tls-san` on the k3s systemd unit: that name stays in the certificate until the unit is rewritten by `kwo-update-k3s`.
+- If your provider sets the hostname from its panel, update it there too: the script only guards against cloud-init and the GCE guest agent.
+- `install.sh` never changes hostname or API domain on an existing installation: it reports the three values when they differ and points to `kwo-rename-host`.
+
 ## Upgrading
 
 ### KWO
@@ -800,6 +853,7 @@ kwo/
 │   ├── list-users.sh
 │   ├── dns.sh                    # DNS provider management
 │   ├── registry.sh              # Private registry management
+│   ├── rename-host.sh           # Hostname / API / registry domain changes
 │   ├── update-k3s.sh            # k3s maintenance
 │   ├── cleanup-k3s.sh
 │   ├── status.sh                 # Diagnostics
