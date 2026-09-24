@@ -165,3 +165,61 @@ check_disk_space() {
     fi
     log_info "Disk space OK: ${available_mb}MB available on $path (need ${required_mb}MB)"
 }
+
+# Major version of the Traefik chart k3s deploys (e.g. 40), read from the
+# HelmChart k3s creates at startup. Prints nothing if it cannot be determined.
+traefik_chart_major() {
+    local chart="" attempt=0
+    while [ $attempt -lt 30 ]; do
+        chart=$(kubectl get helmchart traefik -n kube-system -o jsonpath='{.spec.chart}' 2>/dev/null || true)
+        [ -n "$chart" ] && break
+        attempt=$((attempt + 1))
+        sleep 2
+    done
+    echo "$chart" | grep -oP 'traefik-\K[0-9]+(?=\.)' | head -1 || true
+}
+
+# `ports:` values for the Traefik HelmChartConfig (HTTP→HTTPS redirect on web,
+# TLS on websecure), unindented. Chart 39+ moved these options under
+# ports.<name>.http: the old keys are ignored in silence (no redirect, http://
+# answers 404) and the upstream schema rejects them, so the two layouts cannot
+# be combined. Chart <39 ignores the new keys.
+traefik_ports_values() {
+    local major
+    major=$(traefik_chart_major)
+    if [ -n "$major" ] && [ "$major" -lt 39 ]; then
+        log_info "Traefik chart v${major}: using ports.<name>.redirections layout" >&2
+        cat <<'YAML'
+ports:
+  web:
+    redirections:
+      entryPoint:
+        to: websecure
+        scheme: https
+        permanent: true
+  websecure:
+    tls:
+      enabled: true
+YAML
+    else
+        if [ -n "$major" ]; then
+            log_info "Traefik chart v${major}: using ports.<name>.http layout" >&2
+        else
+            log_warn "Cannot detect Traefik chart version, assuming v39+ (ports.<name>.http layout)" >&2
+        fi
+        cat <<'YAML'
+ports:
+  web:
+    http:
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+          permanent: true
+  websecure:
+    http:
+      tls:
+        enabled: true
+YAML
+    fi
+}

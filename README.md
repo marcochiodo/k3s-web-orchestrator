@@ -784,6 +784,10 @@ sudo kwo-update-k3s --yes
 
 k3s 1.32 ships Traefik v3. KWO's ACME resolver config is reapplied automatically, but custom Traefik `Middleware` or `IngressRoute` resources may need review. See [Traefik v2→v3 migration guide](https://doc.traefik.io/traefik/migration/v2-v3/).
 
+**Traefik chart 39+ (HTTP → HTTPS redirect):**
+
+Traefik chart 39 moved the entrypoint redirect and TLS options under `ports.<name>.http`. The old keys are ignored in silence: no redirect, `http://` answers 404. KWO writes the layout matching the chart k3s ships, detected when `install.sh` or `kwo-dns` regenerate the Traefik config. A cluster configured on an older chart keeps the old layout after an upgrade: `kwo-update-k3s` warns about it, and re-running `sudo ./install.sh` regenerates the config.
+
 **Backup:** Before each upgrade, `kwo-update-k3s` saves an etcd snapshot or SQLite copy to `/var/lib/kwo/backups/`.
 
 **Disk space:** each upgrade keeps the previous version's data (~230MB) for rollback. Once you are satisfied with the upgrade, reclaim that space:

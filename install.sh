@@ -701,6 +701,10 @@ generate_traefik_config() {
 ${env_vars}"
     fi
 
+    # Redirect/TLS keys depend on the Traefik chart version (see traefik_ports_values)
+    local ports_values
+    ports_values=$(traefik_ports_values | sed 's/^/    /')
+
     cat <<EOF | kubectl apply -f -
 apiVersion: helm.cattle.io/v1
 kind: HelmChartConfig
@@ -714,16 +718,7 @@ spec:
     additionalArguments:
 ${additional_args}
 ${env_section}
-    ports:
-      web:
-        redirections:
-          entryPoint:
-            to: websecure
-            scheme: https
-            permanent: true
-      websecure:
-        tls:
-          enabled: true
+${ports_values}
     service:
       spec:
         externalTrafficPolicy: Local

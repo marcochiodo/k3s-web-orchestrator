@@ -374,4 +374,17 @@ if [ "$TYPE" = "minor" ] && [ "$(minor_of "$CURRENT")" -le 31 ] && [ "$(minor_of
     echo "  Traefik v2→v3: check middleware/IngressRoute resources for compatibility"
     echo "  kubectl logs -n kube-system -l app.kubernetes.io/name=traefik"
 fi
+# Traefik chart 39+ reads the HTTP→HTTPS redirect from ports.web.http: a
+# HelmChartConfig written for an older chart keeps the old key, ignored in silence
+if declare -F traefik_chart_major >/dev/null; then
+    TRAEFIK_MAJOR=$(traefik_chart_major)
+    if [ -n "$TRAEFIK_MAJOR" ] && [ "$TRAEFIK_MAJOR" -ge 39 ] && \
+       kubectl get helmchartconfig traefik -n kube-system -o jsonpath='{.spec.valuesContent}' 2>/dev/null \
+           | grep -qE '^    redirections:'; then
+        echo ""
+        echo "  WARNING: Traefik chart v${TRAEFIK_MAJOR} ignores the HTTP→HTTPS redirect of the"
+        echo "  current HelmChartConfig (pre-v39 layout): http:// answers 404."
+        echo "  Regenerate it by re-running: sudo ./install.sh (from the KWO repository)"
+    fi
+fi
 echo ""

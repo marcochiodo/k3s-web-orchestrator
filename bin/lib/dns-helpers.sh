@@ -405,6 +405,10 @@ get_credential_value() {
 regenerate_traefik_config() {
     log_info "Regenerating Traefik configuration..."
 
+    # Redirect/TLS keys depend on the Traefik chart version (see traefik_ports_values)
+    local ports_values
+    ports_values=$(traefik_ports_values | sed 's/^/    /')
+
     # Get ACME email from kwo-config
     local acme_email
     acme_email=$(kubectl get configmap kwo-config -n kube-system -o jsonpath='{.data.acme-email}' 2>/dev/null || echo "")
@@ -435,16 +439,7 @@ spec:
   valuesContent: |-
     persistence:
       enabled: true
-    ports:
-      web:
-        redirections:
-          entryPoint:
-            to: websecure
-            scheme: https
-            permanent: true
-      websecure:
-        tls:
-          enabled: true
+${ports_values}
 EOF
         return 0
     fi
@@ -485,16 +480,7 @@ spec:
   valuesContent: |-
     persistence:
       enabled: true
-    ports:
-      web:
-        redirections:
-          entryPoint:
-            to: websecure
-            scheme: https
-            permanent: true
-      websecure:
-        tls:
-          enabled: true
+${ports_values}
     env:
 $(echo "$cert_resolvers" | sed 's/^/      /' | sed 's/^      $//')
     certificatesResolvers:
